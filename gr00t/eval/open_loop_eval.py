@@ -335,6 +335,13 @@ def main(args: ArgsConfig):
 
     all_mse = []
     all_mae = []
+    save_plot_path = Path(args.save_plot_path) if args.save_plot_path else None
+    save_plot_as_dir = (
+        save_plot_path is not None
+        and (save_plot_path.suffix == "" or save_plot_path.is_dir() or len(args.traj_ids) > 1)
+    )
+    if save_plot_as_dir:
+        save_plot_path.mkdir(parents=True, exist_ok=True)
 
     for traj_id in args.traj_ids:
         if traj_id >= len(dataset):
@@ -350,7 +357,9 @@ def main(args: ArgsConfig):
             args.modality_keys,
             steps=args.steps,
             action_horizon=args.action_horizon,
-            save_plot_path=args.save_plot_path,
+            save_plot_path=str(save_plot_path / f"traj_{traj_id}.jpeg")
+            if save_plot_as_dir
+            else args.save_plot_path,
         )
         logging.info(f"MSE for trajectory {traj_id}: {mse}, MAE: {mae}")
         all_mse.append(mse)

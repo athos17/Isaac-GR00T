@@ -15,6 +15,7 @@
 
 import json
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -150,6 +151,10 @@ class Gr00tN1d7Pipeline(ModelPipeline):
 
     def _create_dataset(self, save_cfg_dir: Path):
         """Create appropriate dataset based on task and mode."""
+        backbone_model_name = os.environ.get(
+            "GR00T_BACKBONE_MODEL_NAME",
+            self.model_config.model_name,
+        )
         if self.config.training.start_from_checkpoint is not None:
             processor = AutoProcessor.from_pretrained(
                 self.config.training.start_from_checkpoint,
@@ -160,7 +165,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 image_target_size=self.model_config.image_target_size,
                 random_rotation_angle=self.model_config.random_rotation_angle,
                 color_jitter_params=self.model_config.color_jitter_params,
-                model_name=self.model_config.model_name,
+                model_name=backbone_model_name,
                 model_type=self.model_config.backbone_model_type,
                 formalize_language=self.model_config.formalize_language,
                 apply_sincos_state_encoding=self.model_config.apply_sincos_state_encoding,
@@ -188,7 +193,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 image_target_size=self.model_config.image_target_size,
                 random_rotation_angle=self.model_config.random_rotation_angle,
                 color_jitter_params=self.model_config.color_jitter_params,
-                model_name=self.model_config.model_name,
+                model_name=backbone_model_name,
                 model_type=self.model_config.backbone_model_type,
                 formalize_language=self.model_config.formalize_language,
                 max_state_dim=self.model_config.max_state_dim,

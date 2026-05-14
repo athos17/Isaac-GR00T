@@ -77,11 +77,23 @@ class Qwen3Backbone(torch.nn.Module):
         if load_bf16:
             extra_kwargs["torch_dtype"] = torch.bfloat16
 
-        self.model = Qwen3VLForConditionalGeneration.from_pretrained(
-            model_name,
-            **extra_kwargs,
-            **transformers_loading_kwargs,
-        ).eval()
+        try:
+            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+                model_name,
+                **extra_kwargs,
+                **transformers_loading_kwargs,
+            ).eval()
+        except OSError as exc:
+            error_text = str(exc)
+            if "gated repo" in error_text.lower() or "Cosmos-Reason2-2B" in error_text:
+                raise OSError(
+                    "Failed to load the GR00T N1.7 backbone. This checkpoint depends on the "
+                    "gated Hugging Face repo 'nvidia/Cosmos-Reason2-2B'. Request access and "
+                    "log in with `uv run huggingface-cli login`, or download that repo to a "
+                    "local path and set `GR00T_BACKBONE_MODEL_NAME=/path/to/Cosmos-Reason2-2B` "
+                    "before running inference."
+                ) from exc
+            raise
 
         # needed since we don't use these layers. Also saves compute
         while len(self.model.language_model.layers) > select_layer:

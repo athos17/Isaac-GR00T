@@ -20,6 +20,7 @@ This module provides the core policy classes for running Gr00t models:
 - Gr00tSimPolicyWrapper: Wrapper for compatibility with existing Gr00t simulation environments
 """
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -95,6 +96,7 @@ class Gr00tPolicy(BasePolicy):
         if isinstance(embodiment_tag, str):
             embodiment_tag = EmbodimentTag.resolve(embodiment_tag)
         model_dir = Path(model_path)
+        backbone_model_name = os.environ.get("GR00T_BACKBONE_MODEL_NAME")
 
         # Load the pretrained model and move to target device with bfloat16 precision
         model = AutoModel.from_pretrained(model_dir)
@@ -112,7 +114,12 @@ class Gr00tPolicy(BasePolicy):
             and not (model_dir / "processor_config.json").exists()
             else model_dir
         )
-        self.processor: BaseProcessor = AutoProcessor.from_pretrained(processor_dir)
+        processor_kwargs = {}
+        if backbone_model_name:
+            processor_kwargs["model_name"] = backbone_model_name
+        self.processor: BaseProcessor = AutoProcessor.from_pretrained(
+            processor_dir, **processor_kwargs
+        )
         self.processor.eval()
 
         # Store embodiment-specific configurations

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+import os
 from typing import Any, Tuple
 
 import torch
@@ -474,7 +475,11 @@ class Gr00tN1d7ActionHead(nn.Module):
 
 
 def get_backbone_cls(config: Gr00tN1d7Config):
-    if "nvidia/Cosmos-Reason2" in config.model_name or "Qwen/Qwen3-VL" in config.model_name:
+    if (
+        config.backbone_model_type == "qwen"
+        or "nvidia/Cosmos-Reason2" in config.model_name
+        or "Qwen/Qwen3-VL" in config.model_name
+    ):
         # We import here as Qwen3Backbone depends on newer transformers versions than the rest of the code.
         from gr00t.model.modules.qwen3_backbone import Qwen3Backbone
 
@@ -511,10 +516,11 @@ class Gr00tN1d7(PreTrainedModel):
         """
         super().__init__(config)
         self.config = config
+        backbone_model_name = os.environ.get("GR00T_BACKBONE_MODEL_NAME", config.model_name)
 
         backbone_cls = get_backbone_cls(config)
         self.backbone = backbone_cls(
-            model_name=config.model_name,
+            model_name=backbone_model_name,
             tune_llm=config.tune_llm,
             tune_visual=config.tune_visual,
             select_layer=config.select_layer,
@@ -531,7 +537,7 @@ class Gr00tN1d7(PreTrainedModel):
         from .processing_gr00t_n1d7 import Gr00tN1d7DataCollator
 
         self.collator = Gr00tN1d7DataCollator(
-            model_name=config.model_name,
+            model_name=backbone_model_name,
             model_type=config.backbone_model_type,
             transformers_loading_kwargs=transformers_loading_kwargs,
         )

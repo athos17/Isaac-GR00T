@@ -296,11 +296,43 @@ def plot_trajectory_results(
 
     plt.tight_layout()
 
-    # Create filename with trajectory ID
-    Path(save_plot_path).parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(save_plot_path)
+    # Best-effort save: plotting should not fail the full evaluation run.
+    output_path = Path(save_plot_path)
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(output_path)
+    except OSError as exc:
+        fallback_path = Path.cwd() / "outputs" / "standalone_inference" / f"traj_{traj_id}.jpeg"
+        if fallback_path != output_path:
+            logging.warning(
+                "Failed to save plot to %s (%s). Falling back to %s.",
+                output_path,
+                exc,
+                fallback_path,
+            )
+            fallback_path.parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(fallback_path)
+        else:
+            logging.warning("Failed to save plot to %s (%s). Continuing.", output_path, exc)
 
     plt.close()  # Close the figure to free memory
+
+
+def resolve_plot_path(
+    save_plot_path: str | None, traj_id: int, multiple_trajectories: bool = False
+) -> str:
+    if save_plot_path is None:
+        return str(Path.cwd() / "outputs" / "standalone_inference" / f"traj_{traj_id}.jpeg")
+
+    output_path = Path(save_plot_path)
+    if output_path.suffix:
+        if multiple_trajectories:
+            return str(
+                output_path.with_name(f"{output_path.stem}_traj_{traj_id}{output_path.suffix}")
+            )
+        return str(output_path)
+
+    return str(output_path / f"traj_{traj_id}.jpeg")
 
 
 def parse_observation_gr00t(
@@ -571,7 +603,7 @@ def evaluate_predictions(
         state_keys=state_keys,
         action_keys=action_keys,
         action_horizon=action_horizon,
-        save_plot_path=save_plot_path or f"/tmp/stand_alone_inference/traj_{traj_id}.jpeg",
+        save_plot_path=save_plot_path or resolve_plot_path(None, traj_id),
     )
 
     return mse, mae
@@ -739,6 +771,7 @@ def main(args: ArgsConfig):
     all_timings = []
     pred_actions = []
     obs = None
+    multiple_trajectories = len(args.traj_ids) > 1
 
     for traj_id in args.traj_ids:
         if traj_id < 0 or traj_id >= len(dataset):
@@ -776,7 +809,9 @@ def main(args: ArgsConfig):
                 traj_id,
                 actual_steps,
                 args.action_horizon,
-                save_plot_path=args.save_plot_path,
+                save_plot_path=resolve_plot_path(
+                    args.save_plot_path, traj_id, multiple_trajectories=multiple_trajectories
+                ),
             )
 
             logging.info(f"MSE for trajectory {traj_id}: {mse}, MAE: {mae}")

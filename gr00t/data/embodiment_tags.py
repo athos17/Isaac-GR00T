@@ -47,6 +47,7 @@ class EmbodimentTag(Enum):
     - LIBERO_PANDA         -> "libero_sim"
 
     Finetuning tag (for custom robots):
+    - R1_LITE              -> "R1_Lite"
     - NEW_EMBODIMENT       -> "new_embodiment"
 
     Use ``EmbodimentTag.resolve(s)`` to look up a tag by name or value,
@@ -120,6 +121,11 @@ class EmbodimentTag(Enum):
     LIBERO_PANDA = "libero_sim"
     """
     The LIBERO Panda robot (used for LIBERO-Goal, LIBERO-Object, LIBERO-Spatial, LIBERO-10).
+    """
+
+    R1_LITE = "R1_Lite"
+    """
+    The Galaxea R1 Lite robot.
     """
 
     # New embodiment during post-training
@@ -202,6 +208,7 @@ POSTTRAIN_TAGS: frozenset[EmbodimentTag] = frozenset(
 
 FINETUNE_ONLY_TAGS: frozenset[EmbodimentTag] = frozenset(
     {
+        EmbodimentTag.R1_LITE,
         EmbodimentTag.NEW_EMBODIMENT,
     }
 )

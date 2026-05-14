@@ -69,6 +69,7 @@ EMBODIMENT_TAG_TO_PROJECTOR_INDEX = {
     "simpler_env_google": 0,
     "simpler_env_widowx": 1,
     "libero_sim": 2,
+    "R1_Lite": 10,
     "new_embodiment": 10,
 }
 
@@ -79,7 +80,8 @@ def build_processor(model_name: str, transformers_loading_kwargs: dict) -> Qwen3
             "Qwen3VLProcessor is not available. "
             "Please upgrade transformers: pip install transformers>=4.52.0"
         )
-    return Qwen3VLProcessor.from_pretrained(model_name, **transformers_loading_kwargs)
+    resolved_model_name = os.environ.get("GR00T_BACKBONE_MODEL_NAME", model_name)
+    return Qwen3VLProcessor.from_pretrained(resolved_model_name, **transformers_loading_kwargs)
 
 
 class Gr00tN1d7DataCollator:
@@ -750,7 +752,10 @@ class Gr00tN1d7Processor(BaseProcessor):
         # Backfill fields that older checkpoints may not have serialized.
         # Without these, __init__ defaults silently apply — correct today but
         # fragile if defaults ever change.
-        processor_kwargs.setdefault("model_name", "nvidia/Cosmos-Reason2-2B")
+        processor_kwargs.setdefault(
+            "model_name",
+            os.environ.get("GR00T_BACKBONE_MODEL_NAME", "nvidia/Cosmos-Reason2-2B"),
+        )
         processor_kwargs.setdefault("model_type", "qwen")
         processor_kwargs.setdefault("clip_outliers", True)
 
