@@ -1,12 +1,12 @@
 # Test debug artifacts
 /debug_video_decoding/
+/ref_paper
 
 # Finetune datasets
 /examples/GR00T-WholeBodyControl/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim/
-/examples/LIBERO/libero_10_no_noops_1.0.0_lerobot/
-/examples/LIBERO/libero_goal_no_noops_1.0.0_lerobot/
-/examples/LIBERO/libero_object_no_noops_1.0.0_lerobot/
-/examples/LIBERO/libero_spatial_no_noops_1.0.0_lerobot/
+/examples/Ego_Humanoid/
+/examples/LIBERO/
+/examples/R1_Lite_4_camera/
 
 # UV lock file
 uv.lock

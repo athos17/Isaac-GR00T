@@ -53,6 +53,7 @@ def plot_trajectory_results(
     action_keys: list[str],
     action_horizon: int,
     save_plot_path: str,
+    plot_state: bool = True,
 ) -> None:
     """
     Plot and save trajectory results comparing ground truth and predicted actions.
@@ -97,7 +98,7 @@ def plot_trajectory_results(
         # The dimensions of state_joints and action are the same
         # only when the robot uses actions directly as joint commands.
         # Therefore, do not plot them if this is not the case.
-        if state_joints_across_time.shape == gt_action_across_time.shape:
+        if plot_state and state_joints_across_time.shape == gt_action_across_time.shape:
             ax.plot(state_joints_across_time[:, action_idx], label="state joints")
         ax.plot(gt_action_across_time[:, action_idx], label="gt action")
         ax.plot(pred_action_across_time[:, action_idx], label="pred action")
@@ -160,6 +161,7 @@ def evaluate_single_trajectory(
     steps=300,
     action_horizon=16,
     save_plot_path=None,
+    plot_state=True,
 ):
     # Ensure steps doesn't exceed trajectory length
     traj = loader[traj_id]
@@ -240,6 +242,7 @@ def evaluate_single_trajectory(
         action_keys=action_keys,
         action_horizon=action_horizon,
         save_plot_path=save_plot_path or f"/tmp/open_loop_eval/traj_{traj_id}.jpeg",
+        plot_state=plot_state,
     )
 
     return mse, mae
@@ -281,6 +284,9 @@ class ArgsConfig:
 
     modality_keys: list[str] | None = None
     """List of modality keys to plot. If None, plot all keys."""
+
+    plot_state: bool = True
+    """Whether to include state joints in plots when state/action dimensions match."""
 
 
 def main(args: ArgsConfig):
@@ -360,6 +366,7 @@ def main(args: ArgsConfig):
             save_plot_path=str(save_plot_path / f"traj_{traj_id}.jpeg")
             if save_plot_as_dir
             else args.save_plot_path,
+            plot_state=args.plot_state,
         )
         logging.info(f"MSE for trajectory {traj_id}: {mse}, MAE: {mae}")
         all_mse.append(mse)
