@@ -317,3 +317,41 @@ class TestShardedSingleStepDataset:
 
         # effective = 50 - 8 + 1 = 43
         assert dataset.get_effective_episode_length(0) == 43
+
+    def test_episode_margins_constrain_step_indices(self):
+        from gr00t.data.embodiment_tags import EmbodimentTag
+        from gr00t.data.types import ModalityConfig
+
+        modality_configs = {
+            "video": ModalityConfig(delta_indices=[0], modality_keys=["cam"]),
+            "state": ModalityConfig(delta_indices=[0], modality_keys=["x"]),
+            "action": ModalityConfig(delta_indices=list(range(8)), modality_keys=["x"]),
+            "language": ModalityConfig(delta_indices=[0], modality_keys=["task"]),
+        }
+
+        with patch(
+            "gr00t.data.dataset.sharded_single_step_dataset.LeRobotEpisodeLoader"
+        ) as MockLoader:
+            mock_loader = MagicMock()
+            mock_loader.episode_lengths = [50]
+            mock_loader.get_episode_length = lambda idx: 50
+            MockLoader.return_value = mock_loader
+
+            from gr00t.data.dataset.sharded_single_step_dataset import ShardedSingleStepDataset
+
+            dataset = ShardedSingleStepDataset(
+                dataset_path="/fake/dataset",
+                embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
+                modality_configs=modality_configs,
+                shard_size=1024,
+                episode_sampling_rate=1.0,
+                episode_start_margin=5,
+                episode_end_margin=3,
+            )
+
+        # valid starts: [5, 50 - 3 - 8] = [5, 39]
+        assert dataset.get_effective_episode_length(0) == 35
+        step_indices = dataset.sharded_episodes[0][0][1]
+        assert len(step_indices) == 35
+        assert step_indices.min() == 5
+        assert step_indices.max() == 39

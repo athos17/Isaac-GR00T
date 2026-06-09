@@ -140,6 +140,8 @@ class ShardedSingleStepDataset(ShardedDataset):
         episode_sampling_rate: float = 0.1,
         seed: int = 42,
         allow_padding: bool = False,
+        episode_start_margin: int = 0,
+        episode_end_margin: int = 0,
     ):
         """Initialize single-step dataset with sharding configuration."""
         super().__init__(dataset_path)
@@ -151,6 +153,10 @@ class ShardedSingleStepDataset(ShardedDataset):
         self.episode_sampling_rate = episode_sampling_rate
         self.seed = seed
         self.allow_padding = allow_padding
+        if episode_start_margin < 0 or episode_end_margin < 0:
+            raise ValueError("Episode margins must be non-negative")
+        self.episode_start_margin = episode_start_margin
+        self.episode_end_margin = episode_end_margin
         self.processor = None
         self.rng = np.random.default_rng(seed)
         action_delta_indices = modality_configs["action"].delta_indices
@@ -192,6 +198,11 @@ class ShardedSingleStepDataset(ShardedDataset):
         total_steps = np.sum(
             [self.get_effective_episode_length(idx) for idx in shuffled_episode_indices]
         ).astype(int)
+        assert total_steps > 0, (
+            f"No valid timesteps found for dataset {self.dataset_path}. "
+            f"Check episode margins start={self.episode_start_margin}, "
+            f"end={self.episode_end_margin}, and action horizon={self.action_horizon}."
+        )
         num_shards = np.ceil(total_steps / self.shard_size).astype(int)
 
         # Initialize shard containers
@@ -201,7 +212,10 @@ class ShardedSingleStepDataset(ShardedDataset):
         # Distribute episode sub-sequences across shards
         for ep_idx in shuffled_episode_indices:
             # Split episode timesteps into multiple sub-sequences
-            step_indices = np.arange(0, self.get_effective_episode_length(ep_idx))
+            step_indices = np.arange(
+                self.episode_start_margin,
+                self.episode_start_margin + self.get_effective_episode_length(ep_idx),
+            )
             self.rng.shuffle(step_indices)
             for i in range(num_splits):
                 split_step_indices = step_indices[i::num_splits]
@@ -223,9 +237,16 @@ class ShardedSingleStepDataset(ShardedDataset):
         self.shard_lengths = shard_lengths
 
     def get_effective_episode_length(self, episode_index: int) -> int:
-        """Get the effective episode length accounting for action horizon."""
+        """Get the effective episode length accounting for margins and action horizon."""
         original_length = self.episode_loader.get_episode_length(episode_index)
-        return max(0, original_length - self.action_horizon + 1)
+        return max(
+            0,
+            original_length
+            - self.episode_start_margin
+            - self.episode_end_margin
+            - self.action_horizon
+            + 1,
+        )
 
     def __len__(self):
         """Return the number of shards in the dataset."""

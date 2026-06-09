@@ -151,6 +151,12 @@ class FinetuneConfig:
     episode_sampling_rate: float = 0.1
     """Sampling rate for the episodes."""
 
+    episode_start_margin: int = 0
+    """Number of frames to skip at the beginning of each episode when sampling training steps."""
+
+    episode_end_margin: int = 0
+    """Number of frames to exclude at the end of each episode when sampling training action chunks."""
+
     num_shards_per_epoch: int = int(1e5)
     """Number of shards to use for the dataset. reduce this number if vram is limited."""
 

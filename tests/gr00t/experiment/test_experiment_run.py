@@ -184,3 +184,35 @@ def test_experiment_run_single_gpu(tmp_path, monkeypatch):
 
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
+
+
+def test_experiment_run_passes_wandb_init_timeout(tmp_path, monkeypatch):
+    from gr00t.configs.base_config import get_default_config
+    import gr00t.experiment.experiment as experiment
+
+    class StopAfterWandbInit(Exception):
+        pass
+
+    captured = {}
+
+    def fake_wandb_init(**kwargs):
+        captured.update(kwargs)
+
+    class StopPipeline:
+        def __init__(self, *args, **kwargs):
+            raise StopAfterWandbInit
+
+    config = get_default_config()
+    config.training.output_dir = str(tmp_path / "experiment_output")
+    config.training.use_wandb = True
+    config.training.wandb_init_timeout = 300
+
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    monkeypatch.setattr(experiment.wandb, "init", fake_wandb_init)
+    monkeypatch.setattr(experiment.MODEL_REGISTRY, "get", lambda *_args, **_kwargs: StopPipeline)
+
+    with pytest.raises(StopAfterWandbInit):
+        experiment.run(config)
+
+    assert "settings" in captured
+    assert captured["settings"].init_timeout == 300
