@@ -8,6 +8,7 @@ actions, and the wrist RGB cameras to those anchors, and writes one MP4 per came
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 import json
 import math
@@ -78,6 +79,37 @@ class AlignedEpisode:
     source: str
     hand_feature_names: dict[str, list[str]]
     video_shapes: dict[str, tuple[int, int, int]]
+
+
+@dataclass(frozen=True)
+class EpisodeConversionTask:
+    episode_index: int
+    bag_dir: Path
+    output_dir: Path
+    rotation_format: str
+    max_time_skew: float
+    topics: dict[str, str]
+    work_dir: Path | None
+    bag_backend: str
+    timestamp_source: TimestampSource
+    output_fps: float | None
+    image_size: tuple[int, int] | None
+    chunks_size: int
+    global_start_index: int
+
+
+@dataclass(frozen=True)
+class EpisodeConversionResult:
+    episode_index: int
+    length: int
+    source: str
+    fps: float
+    max_skew: float
+    camera_frame_count: int
+    hand_feature_names: dict[str, list[str]]
+    video_shapes: dict[str, tuple[int, int, int]]
+    parquet_path: Path
+    written_global_start_index: int
 
 
 def _load_metadata(bag_dir: Path) -> dict[str, Any]:
@@ -930,6 +962,299 @@ def _validate_metadata_topics(bag_dir: Path, topics: dict[str, str]) -> None:
         raise ValueError(f"{bag_dir} has required topics with zero messages: {empty}")
 
 
+def _episode_data_dir(output_dir: Path, episode_index: int, chunks_size: int) -> Path:
+    episode_chunk = episode_index // chunks_size
+    return output_dir / "data" / f"chunk-{episode_chunk:03d}"
+
+
+def _episode_video_base_dir(output_dir: Path, episode_index: int, chunks_size: int) -> Path:
+    episode_chunk = episode_index // chunks_size
+    return output_dir / "videos" / f"chunk-{episode_chunk:03d}"
+
+
+def _parallel_episode_work_dir(work_dir: Path | None, episode_index: int) -> Path | None:
+    if work_dir is None:
+        return None
+    return work_dir / f"episode-{episode_index:06d}"
+
+
+def _write_episode_outputs(task: EpisodeConversionTask) -> EpisodeConversionResult:
+    episode = _align_episode(
+        bag_dir=task.bag_dir,
+        rotation_format=task.rotation_format,
+        max_time_skew=task.max_time_skew,
+        topics=task.topics,
+        work_dir=task.work_dir,
+        bag_backend=task.bag_backend,
+        timestamp_source=task.timestamp_source,
+    )
+    episode_fps = task.output_fps or _estimate_fps(episode.timestamps)
+
+    data_dir = _episode_data_dir(task.output_dir, task.episode_index, task.chunks_size)
+    video_base_dir = _episode_video_base_dir(task.output_dir, task.episode_index, task.chunks_size)
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    df = _rows_to_dataframe(
+        episode=episode,
+        episode_index=task.episode_index,
+        task_index=0,
+        global_start_index=task.global_start_index,
+    )
+    parquet_path = data_dir / f"episode_{task.episode_index:06d}.parquet"
+    df.to_parquet(parquet_path, index=False)
+
+    for topic_key, modality_key in VIDEO_MODALITY_KEYS.items():
+        video_path = (
+            video_base_dir
+            / f"observation.images.{modality_key}"
+            / f"episode_{task.episode_index:06d}.mp4"
+        )
+        written_shape = _write_video(
+            video_path,
+            episode.videos[topic_key],
+            episode_fps,
+            task.image_size,
+        )
+        episode.video_shapes[topic_key] = written_shape
+
+    return EpisodeConversionResult(
+        episode_index=task.episode_index,
+        length=len(df),
+        source=episode.source,
+        fps=episode_fps,
+        max_skew=episode.max_skew,
+        camera_frame_count=episode.camera_frame_count,
+        hand_feature_names=episode.hand_feature_names,
+        video_shapes=episode.video_shapes,
+        parquet_path=parquet_path,
+        written_global_start_index=task.global_start_index,
+    )
+
+
+def _rewrite_parquet_global_index(
+    parquet_path: Path,
+    global_start_index: int,
+    length: int,
+) -> None:
+    df = pd.read_parquet(parquet_path)
+    df["index"] = np.arange(global_start_index, global_start_index + length, dtype=np.int64)
+    df.to_parquet(parquet_path, index=False)
+
+
+def _episode_metadata(
+    result: EpisodeConversionResult,
+    task_description: str,
+    timestamp_source: TimestampSource,
+    max_time_skew: float,
+    topics: dict[str, str],
+) -> dict[str, Any]:
+    return {
+        "episode_index": result.episode_index,
+        "tasks": [task_description],
+        "length": result.length,
+        "source_file": result.source,
+        "alignment": {
+            "anchor": "head_rgb",
+            "timestamp_source": timestamp_source,
+            "output_fps": result.fps,
+            "camera_frame_count": result.camera_frame_count,
+            "max_time_skew_sec": result.max_skew,
+            "max_time_skew_warning_threshold_sec": max_time_skew,
+            "video_topics": {key: topics[key] for key in VIDEO_TOPIC_KEYS},
+        },
+    }
+
+
+def _print_episode_summary(
+    result: EpisodeConversionResult, bag_name: str, max_time_skew: float
+) -> None:
+    warning = ""
+    if result.max_skew > max_time_skew:
+        warning = f", warning: max_skew>{max_time_skew:.4f}s"
+    print(
+        f"[{result.episode_index:04d}] {bag_name}: {result.length} frames, "
+        f"head-anchored, output_fps={result.fps:.3f}, "
+        f"max_skew={result.max_skew:.4f}s{warning}"
+    )
+
+
+def _validate_common_episode_metadata(
+    result: EpisodeConversionResult,
+    hand_feature_names: dict[str, list[str]] | None,
+    video_shapes: dict[str, tuple[int, int, int]] | None,
+) -> tuple[dict[str, list[str]], dict[str, tuple[int, int, int]]]:
+    if hand_feature_names is None:
+        hand_feature_names = result.hand_feature_names
+    elif hand_feature_names != result.hand_feature_names:
+        raise ValueError(
+            "All episodes must use the same raw hand joint names and dimensions for one dataset."
+        )
+
+    if video_shapes is None:
+        video_shapes = result.video_shapes
+    elif video_shapes != result.video_shapes:
+        raise ValueError(
+            "All episodes must use the same video shapes for one dataset. "
+            "Pass --image-width and --image-height to resize during conversion."
+        )
+    return hand_feature_names, video_shapes
+
+
+def _make_episode_task(
+    *,
+    episode_index: int,
+    bag_dir: Path,
+    args: argparse.Namespace,
+    output_dir: Path,
+    topics: dict[str, str],
+    work_dir: Path | None,
+    image_size: tuple[int, int] | None,
+    global_start_index: int,
+) -> EpisodeConversionTask:
+    return EpisodeConversionTask(
+        episode_index=episode_index,
+        bag_dir=bag_dir,
+        output_dir=output_dir,
+        rotation_format=args.eef_rotation_format,
+        max_time_skew=args.max_time_skew,
+        topics=topics,
+        work_dir=work_dir,
+        bag_backend=args.bag_backend,
+        timestamp_source=args.timestamp_source,
+        output_fps=args.output_fps,
+        image_size=image_size,
+        chunks_size=args.chunks_size,
+        global_start_index=global_start_index,
+    )
+
+
+def _convert_episodes_sequential(
+    bag_dirs: list[Path],
+    args: argparse.Namespace,
+    output_dir: Path,
+    topics: dict[str, str],
+    work_dir: Path | None,
+    image_size: tuple[int, int] | None,
+) -> tuple[
+    list[dict[str, Any]],
+    list[float],
+    int,
+    dict[str, list[str]] | None,
+    dict[str, tuple[int, int, int]] | None,
+]:
+    global_frame_index = 0
+    episodes_meta = []
+    episode_fps_values = []
+    hand_feature_names = None
+    video_shapes = None
+
+    for episode_index, bag_dir in enumerate(bag_dirs):
+        task = _make_episode_task(
+            episode_index=episode_index,
+            bag_dir=bag_dir,
+            args=args,
+            output_dir=output_dir,
+            topics=topics,
+            work_dir=work_dir,
+            image_size=image_size,
+            global_start_index=global_frame_index,
+        )
+        result = _write_episode_outputs(task)
+        hand_feature_names, video_shapes = _validate_common_episode_metadata(
+            result,
+            hand_feature_names,
+            video_shapes,
+        )
+        episodes_meta.append(
+            _episode_metadata(
+                result,
+                args.task_description,
+                args.timestamp_source,
+                args.max_time_skew,
+                topics,
+            )
+        )
+        episode_fps_values.append(result.fps)
+        _print_episode_summary(result, bag_dir.name, args.max_time_skew)
+        global_frame_index += result.length
+
+    return episodes_meta, episode_fps_values, global_frame_index, hand_feature_names, video_shapes
+
+
+def _convert_episodes_parallel(
+    bag_dirs: list[Path],
+    args: argparse.Namespace,
+    output_dir: Path,
+    topics: dict[str, str],
+    work_dir: Path | None,
+    image_size: tuple[int, int] | None,
+) -> tuple[
+    list[dict[str, Any]],
+    list[float],
+    int,
+    dict[str, list[str]] | None,
+    dict[str, tuple[int, int, int]] | None,
+]:
+    tasks = [
+        _make_episode_task(
+            episode_index=episode_index,
+            bag_dir=bag_dir,
+            args=args,
+            output_dir=output_dir,
+            topics=topics,
+            work_dir=_parallel_episode_work_dir(work_dir, episode_index),
+            image_size=image_size,
+            global_start_index=0,
+        )
+        for episode_index, bag_dir in enumerate(bag_dirs)
+    ]
+
+    pending_results: dict[int, EpisodeConversionResult] = {}
+    next_to_finalize = 0
+    global_frame_index = 0
+    episodes_meta = []
+    episode_fps_values = []
+    hand_feature_names = None
+    video_shapes = None
+
+    with ProcessPoolExecutor(max_workers=args.num_workers) as executor:
+        futures = {executor.submit(_write_episode_outputs, task): task for task in tasks}
+        for future in as_completed(futures):
+            task = futures[future]
+            pending_results[task.episode_index] = future.result()
+
+            while next_to_finalize in pending_results:
+                result = pending_results.pop(next_to_finalize)
+                if result.written_global_start_index != global_frame_index:
+                    _rewrite_parquet_global_index(
+                        result.parquet_path,
+                        global_frame_index,
+                        result.length,
+                    )
+                hand_feature_names, video_shapes = _validate_common_episode_metadata(
+                    result,
+                    hand_feature_names,
+                    video_shapes,
+                )
+                episodes_meta.append(
+                    _episode_metadata(
+                        result,
+                        args.task_description,
+                        args.timestamp_source,
+                        args.max_time_skew,
+                        topics,
+                    )
+                )
+                episode_fps_values.append(result.fps)
+                _print_episode_summary(
+                    result, bag_dirs[result.episode_index].name, args.max_time_skew
+                )
+                global_frame_index += result.length
+                next_to_finalize += 1
+
+    return episodes_meta, episode_fps_values, global_frame_index, hand_feature_names, video_shapes
+
+
 def convert(args: argparse.Namespace) -> None:
     input_root = Path(args.input_root).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
@@ -959,98 +1284,45 @@ def convert(args: argparse.Namespace) -> None:
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    global_frame_index = 0
-    episodes_meta = []
-    episode_fps_values = []
-    hand_feature_names = None
     image_size = None
     if args.image_width is not None or args.image_height is not None:
         if args.image_width is None or args.image_height is None:
             raise ValueError("--image-width and --image-height must be provided together")
         image_size = (args.image_width, args.image_height)
-    video_shapes = None
+    if args.num_workers < 1:
+        raise ValueError("--num-workers must be >= 1")
 
-    for episode_index, bag_dir in enumerate(bag_dirs):
-        episode = _align_episode(
-            bag_dir=bag_dir,
-            rotation_format=args.eef_rotation_format,
-            max_time_skew=args.max_time_skew,
+    if args.num_workers == 1:
+        (
+            episodes_meta,
+            episode_fps_values,
+            global_frame_index,
+            hand_feature_names,
+            video_shapes,
+        ) = _convert_episodes_sequential(
+            bag_dirs=bag_dirs,
+            args=args,
+            output_dir=output_dir,
             topics=topics,
             work_dir=work_dir,
-            bag_backend=args.bag_backend,
-            timestamp_source=args.timestamp_source,
+            image_size=image_size,
         )
-        episode_fps = args.output_fps or _estimate_fps(episode.timestamps)
-        episode_fps_values.append(episode_fps)
-        if hand_feature_names is None:
-            hand_feature_names = episode.hand_feature_names
-        elif hand_feature_names != episode.hand_feature_names:
-            raise ValueError(
-                "All episodes must use the same raw hand joint names and dimensions "
-                "for one dataset."
-            )
-
-        episode_chunk = episode_index // args.chunks_size
-        data_dir = output_dir / "data" / f"chunk-{episode_chunk:03d}"
-        video_base_dir = output_dir / "videos" / f"chunk-{episode_chunk:03d}"
-        data_dir.mkdir(parents=True, exist_ok=True)
-
-        df = _rows_to_dataframe(
-            episode=episode,
-            episode_index=episode_index,
-            task_index=0,
-            global_start_index=global_frame_index,
+    else:
+        print(f"Converting {len(bag_dirs)} episodes with {args.num_workers} worker processes")
+        (
+            episodes_meta,
+            episode_fps_values,
+            global_frame_index,
+            hand_feature_names,
+            video_shapes,
+        ) = _convert_episodes_parallel(
+            bag_dirs=bag_dirs,
+            args=args,
+            output_dir=output_dir,
+            topics=topics,
+            work_dir=work_dir,
+            image_size=image_size,
         )
-        parquet_path = data_dir / f"episode_{episode_index:06d}.parquet"
-        df.to_parquet(parquet_path, index=False)
-
-        for topic_key, modality_key in VIDEO_MODALITY_KEYS.items():
-            video_path = (
-                video_base_dir
-                / f"observation.images.{modality_key}"
-                / f"episode_{episode_index:06d}.mp4"
-            )
-            written_shape = _write_video(
-                video_path,
-                episode.videos[topic_key],
-                episode_fps,
-                image_size,
-            )
-            episode.video_shapes[topic_key] = written_shape
-        if video_shapes is None:
-            video_shapes = episode.video_shapes
-        elif video_shapes != episode.video_shapes:
-            raise ValueError(
-                "All episodes must use the same video shapes for one dataset. "
-                "Pass --image-width and --image-height to resize during conversion."
-            )
-
-        episodes_meta.append(
-            {
-                "episode_index": episode_index,
-                "tasks": [args.task_description],
-                "length": len(df),
-                "source_file": episode.source,
-                "alignment": {
-                    "anchor": "head_rgb",
-                    "timestamp_source": args.timestamp_source,
-                    "output_fps": episode_fps,
-                    "camera_frame_count": episode.camera_frame_count,
-                    "max_time_skew_sec": episode.max_skew,
-                    "max_time_skew_warning_threshold_sec": args.max_time_skew,
-                    "video_topics": {key: topics[key] for key in VIDEO_TOPIC_KEYS},
-                },
-            }
-        )
-        warning = ""
-        if episode.max_skew > args.max_time_skew:
-            warning = f", warning: max_skew>{args.max_time_skew:.4f}s"
-        print(
-            f"[{episode_index:04d}] {bag_dir.name}: {len(df)} frames, "
-            f"head-anchored, output_fps={episode_fps:.3f}, "
-            f"max_skew={episode.max_skew:.4f}s{warning}"
-        )
-        global_frame_index += len(df)
 
     metadata_fps = args.output_fps or float(np.median(np.asarray(episode_fps_values)))
     _write_metadata(
@@ -1123,6 +1395,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--chunks-size", type=int, default=1000)
     parser.add_argument("--max-episodes", type=int, default=None)
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of episode conversion worker processes. The default 1 keeps the "
+            "previous sequential behavior; use >1 to process multiple bags in parallel."
+        ),
+    )
     parser.add_argument(
         "--task-description",
         default="",

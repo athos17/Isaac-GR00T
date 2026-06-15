@@ -69,6 +69,7 @@ python data_preprocess/wuji_rosbag_to_gr00t.py \
   --task-description "" \
   --bag-backend rosbags \
   --work-dir /tmp/wuji_bag_cache \
+  --num-workers 4 \
   --overwrite
 ```
 
@@ -83,8 +84,13 @@ python data_preprocess/wuji_rosbag_to_gr00t.py \
   --task-description "" \
   --bag-backend rosbags \
   --work-dir /tmp/wuji_bag_cache \
+  --num-workers 4 \
   --overwrite
 ```
+
+`--num-workers` 控制 episode 级并行进程数。默认是 `1`，保持原来的顺序处理；
+设置为大于 `1` 时，不同 rosbag 会并行读取、对齐和写视频。建议先从 `4` 开始，
+如果机器内存、磁盘 IO 和 ffmpeg 编码压力允许，再继续增大。
 
 默认任务文本为空。需要语言指令时，由外部传入：
 

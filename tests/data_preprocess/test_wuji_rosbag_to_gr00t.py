@@ -4,7 +4,9 @@ from data_preprocess.wuji_rosbag_to_gr00t import (
     _joint_sample,
     _message_timestamp,
     _prepare_video_frame,
+    _rewrite_parquet_global_index,
     _write_video,
+    parse_args,
 )
 import numpy as np
 import pytest
@@ -72,6 +74,34 @@ def test_message_timestamp_header_mode_falls_back_to_rosbag_when_header_is_zero(
     msg = SimpleNamespace(header=SimpleNamespace(stamp=SimpleNamespace(sec=0, nanosec=0)))
 
     assert _message_timestamp(msg, fallback_ns=99_000_000_000, timestamp_source="header") == 99.0
+
+
+def test_parse_args_accepts_num_workers(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["wuji_rosbag_to_gr00t.py", "--num-workers", "3"],
+    )
+
+    args = parse_args()
+
+    assert args.num_workers == 3
+
+
+def test_rewrite_parquet_global_index_updates_index_column(tmp_path):
+    pd = pytest.importorskip("pandas")
+    parquet_path = tmp_path / "episode_000001.parquet"
+    df = pd.DataFrame(
+        {
+            "frame_index": np.arange(3, dtype=np.int64),
+            "index": np.arange(3, dtype=np.int64),
+        }
+    )
+    df.to_parquet(parquet_path, index=False)
+
+    _rewrite_parquet_global_index(parquet_path, global_start_index=10, length=3)
+
+    rewritten = pd.read_parquet(parquet_path)
+    np.testing.assert_array_equal(rewritten["index"].to_numpy(), np.array([10, 11, 12]))
 
 
 def test_write_video_streams_rgb_frames_to_ffmpeg(monkeypatch, tmp_path):
