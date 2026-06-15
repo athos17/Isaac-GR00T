@@ -1,6 +1,9 @@
 from types import SimpleNamespace
 
 from data_preprocess.wuji_rosbag_to_gr00t import (
+    DEFAULT_TOPICS,
+    TimedSample,
+    _align_episode,
     _joint_sample,
     _message_timestamp,
     _prepare_video_frame,
@@ -10,6 +13,60 @@ from data_preprocess.wuji_rosbag_to_gr00t import (
 )
 import numpy as np
 import pytest
+
+
+def _samples_from_timestamps(timestamps, value_factory):
+    return [
+        TimedSample(float(timestamp), value_factory(float(timestamp))) for timestamp in timestamps
+    ]
+
+
+def test_align_episode_uses_common_time_window_across_all_target_streams(monkeypatch, tmp_path):
+    def eef_value(timestamp):
+        return np.full(6, timestamp, dtype=np.float32)
+
+    def hand_value(timestamp):
+        return np.full(4, timestamp, dtype=np.float32)
+
+    def image_value(timestamp):
+        return np.full((2, 2, 3), int(timestamp * 10), dtype=np.uint8)
+
+    streams = {
+        "left_eef_state": _samples_from_timestamps([1, 2, 3], eef_value),
+        "right_eef_state": _samples_from_timestamps([1, 2, 3], eef_value),
+        "left_eef_action": _samples_from_timestamps([1, 2, 3], eef_value),
+        "right_eef_action": _samples_from_timestamps([1, 2, 3], eef_value),
+        "left_hand_state": _samples_from_timestamps([1, 2, 3], hand_value),
+        "right_hand_state": _samples_from_timestamps([1, 2, 3], hand_value),
+        "left_hand_action": _samples_from_timestamps([1, 2, 3], hand_value),
+        "right_hand_action": _samples_from_timestamps([1, 2, 3], hand_value),
+        "head_rgb": _samples_from_timestamps([0, 1, 2, 3, 4], image_value),
+        "left_wrist_rgb": _samples_from_timestamps([0, 1, 2, 3, 4], image_value),
+        "right_wrist_rgb": _samples_from_timestamps([0, 1, 2, 3, 4], image_value),
+    }
+    hand_feature_names = {
+        "left_hand_joints": [f"left_hand_joints.raw_joint_{index}" for index in range(4)],
+        "right_hand_joints": [f"right_hand_joints.raw_joint_{index}" for index in range(4)],
+    }
+
+    monkeypatch.setattr(
+        "data_preprocess.wuji_rosbag_to_gr00t._build_streams",
+        lambda **kwargs: (streams, hand_feature_names),
+    )
+
+    episode = _align_episode(
+        bag_dir=tmp_path,
+        rotation_format="rotvec",
+        max_time_skew=0.06,
+        topics=DEFAULT_TOPICS,
+        work_dir=None,
+        bag_backend="rosbags",
+        timestamp_source="header",
+    )
+
+    assert len(episode.state) == 3
+    np.testing.assert_array_equal(episode.timestamps, np.array([0.0, 1.0, 2.0], dtype=np.float32))
+    assert [int(frame[0, 0, 0]) for frame in episode.videos["head_rgb"]] == [10, 20, 30]
 
 
 def test_joint_sample_keeps_raw_left_hand_position_order_and_dimension():

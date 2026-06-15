@@ -11,7 +11,8 @@
 时间对齐策略：
 
 - 使用头部 RGB 的时间戳作为 anchor clock。
-- 最终 episode 帧数为 `min(head_rgb_frames, left_wrist_rgb_frames, right_wrist_rgb_frames)`。
+- 先计算 11 个目标 topic 的时间范围交集，只保留交集内的头部 RGB anchor 帧。
+- 最终 episode 帧数为落在公共时间窗内的 `head_rgb` 帧数。
 - 对每个 head timestamp，左右腕相机、state topic、action topic 都取最近邻样本。
 - `--max-time-skew` 只是诊断阈值，会写入 metadata/log；不会重采样到 30Hz，也不会改变最终帧数。
 

@@ -475,6 +475,22 @@ def _nearest_sample(
     return best, cursor, abs(best.timestamp - timestamp)
 
 
+def _common_time_window(streams: dict[str, list[TimedSample]]) -> tuple[float, float]:
+    starts = {name: samples[0].timestamp for name, samples in streams.items()}
+    ends = {name: samples[-1].timestamp for name, samples in streams.items()}
+    common_start = max(starts.values())
+    common_end = min(ends.values())
+    if common_start > common_end:
+        latest_start_stream = max(starts, key=starts.__getitem__)
+        earliest_end_stream = min(ends, key=ends.__getitem__)
+        raise ValueError(
+            "Target topics do not share a common time window: "
+            f"latest start is {latest_start_stream} at {common_start:.6f}s, "
+            f"earliest end is {earliest_end_stream} at {common_end:.6f}s"
+        )
+    return common_start, common_end
+
+
 def _build_streams(
     bag_dir: Path,
     rotation_format: str,
@@ -598,13 +614,19 @@ def _align_episode(
         timestamp_source=timestamp_source,
     )
 
-    camera_frame_count = min(len(streams[key]) for key in VIDEO_TOPIC_KEYS)
-    if camera_frame_count <= 0:
-        raise ValueError(f"{bag_dir} has no complete RGB camera frames")
+    common_start, common_end = _common_time_window(streams)
 
-    # The head camera is the clock. To keep the three MP4s the same length, use
-    # exactly the minimum RGB frame count requested by the user.
-    anchor_samples = streams["head_rgb"][:camera_frame_count]
+    # The head camera is the clock, but only after trimming to the time range
+    # shared by every target topic so boundary frames cannot align to stale data.
+    anchor_samples = [
+        sample for sample in streams["head_rgb"] if common_start <= sample.timestamp <= common_end
+    ]
+    camera_frame_count = len(anchor_samples)
+    if camera_frame_count <= 0:
+        raise ValueError(
+            f"{bag_dir} has no head RGB frames inside the common target-topic time window "
+            f"[{common_start:.6f}, {common_end:.6f}]"
+        )
     start = anchor_samples[0].timestamp
 
     cursors = {name: 0 for name in streams}
