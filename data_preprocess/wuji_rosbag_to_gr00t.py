@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 from pathlib import Path
@@ -22,6 +22,69 @@ import cv2
 import numpy as np
 import pandas as pd
 import yaml
+
+# Try multiple import strategies for motion detection modules
+MOTION_DETECTION_AVAILABLE = False
+
+# Add current directory and parent directory to path for imports
+import sys
+from pathlib import Path as _ImportPath
+_script_dir = _ImportPath(__file__).parent
+_project_root = _script_dir.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+if str(_script_dir) not in sys.path:
+    sys.path.insert(0, str(_script_dir))
+
+try:
+    # Try relative import first (when run as module)
+    from .motion_detection import (
+        MotionDetectionConfig,
+        MotionDetectionResult,
+        detect_motion_window,
+        trim_episode_to_motion,
+    )
+    from .quality_report import (
+        EpisodeQualityMetrics,
+        create_dataset_summary,
+        create_episode_quality_metrics,
+        write_quality_report,
+    )
+    MOTION_DETECTION_AVAILABLE = True
+except ImportError:
+    try:
+        # Try absolute import (when run as script from project root)
+        from data_preprocess.motion_detection import (
+            MotionDetectionConfig,
+            MotionDetectionResult,
+            detect_motion_window,
+            trim_episode_to_motion,
+        )
+        from data_preprocess.quality_report import (
+            EpisodeQualityMetrics,
+            create_dataset_summary,
+            create_episode_quality_metrics,
+            write_quality_report,
+        )
+        MOTION_DETECTION_AVAILABLE = True
+    except ImportError:
+        try:
+            # Try direct import from same directory
+            from motion_detection import (
+                MotionDetectionConfig,
+                MotionDetectionResult,
+                detect_motion_window,
+                trim_episode_to_motion,
+            )
+            from quality_report import (
+                EpisodeQualityMetrics,
+                create_dataset_summary,
+                create_episode_quality_metrics,
+                write_quality_report,
+            )
+            MOTION_DETECTION_AVAILABLE = True
+        except ImportError:
+            pass
 
 
 DEFAULT_TOPICS = {
@@ -79,6 +142,7 @@ class AlignedEpisode:
     source: str
     hand_feature_names: dict[str, list[str]]
     video_shapes: dict[str, tuple[int, int, int]]
+    motion_detection_result: Any | None = None  # MotionDetectionResult if enabled
 
 
 @dataclass(frozen=True)
@@ -96,6 +160,7 @@ class EpisodeConversionTask:
     image_size: tuple[int, int] | None
     chunks_size: int
     global_start_index: int
+    motion_detection_config: Any | None = None  # MotionDetectionConfig if enabled
 
 
 @dataclass(frozen=True)
@@ -110,6 +175,9 @@ class EpisodeConversionResult:
     video_shapes: dict[str, tuple[int, int, int]]
     parquet_path: Path
     written_global_start_index: int
+    original_length: int
+    motion_detection_result: Any | None = None  # MotionDetectionResult if enabled
+    quality_metrics: Any | None = None  # EpisodeQualityMetrics if enabled
 
 
 def _load_metadata(bag_dir: Path) -> dict[str, Any]:
@@ -604,6 +672,7 @@ def _align_episode(
     work_dir: Path | None,
     bag_backend: str,
     timestamp_source: TimestampSource,
+    motion_detection_config: Any | None = None,
 ) -> AlignedEpisode:
     streams, hand_feature_names = _build_streams(
         bag_dir=bag_dir,
@@ -676,16 +745,33 @@ def _align_episode(
     if not states:
         raise ValueError(f"No frames produced for {bag_dir}. Inspect RGB topic timestamps.")
 
+    state_array = np.stack(states).astype(np.float32)
+    action_array = np.stack(actions).astype(np.float32)
+    timestamps_array = np.asarray(kept_timestamps, dtype=np.float32)
+
+    # Apply motion detection if enabled
+    motion_result = None
+    if motion_detection_config is not None and MOTION_DETECTION_AVAILABLE:
+        eef_dim = 9 if rotation_format == "rot6d" else 6
+        motion_result = detect_motion_window(
+            state_array, action_array, motion_detection_config, eef_dim=eef_dim
+        )
+        # Trim episode to motion window
+        state_array, action_array, videos, timestamps_array = trim_episode_to_motion(
+            state_array, action_array, videos, timestamps_array, motion_result
+        )
+
     return AlignedEpisode(
-        state=np.stack(states).astype(np.float32),
-        action=np.stack(actions).astype(np.float32),
+        state=state_array,
+        action=action_array,
         videos=videos,
-        timestamps=np.asarray(kept_timestamps, dtype=np.float32),
+        timestamps=timestamps_array,
         max_skew=max_seen_skew,
         camera_frame_count=camera_frame_count,
         source=str(bag_dir),
         hand_feature_names=hand_feature_names,
         video_shapes={key: tuple(videos[key][0].shape) for key in VIDEO_TOPIC_KEYS},
+        motion_detection_result=motion_result,
     )
 
 
@@ -1009,6 +1095,7 @@ def _write_episode_outputs(task: EpisodeConversionTask) -> EpisodeConversionResu
         work_dir=task.work_dir,
         bag_backend=task.bag_backend,
         timestamp_source=task.timestamp_source,
+        motion_detection_config=task.motion_detection_config,
     )
     episode_fps = task.output_fps or _estimate_fps(episode.timestamps)
 
@@ -1039,6 +1126,27 @@ def _write_episode_outputs(task: EpisodeConversionTask) -> EpisodeConversionResu
         )
         episode.video_shapes[topic_key] = written_shape
 
+    # Generate quality metrics if enabled
+    quality_metrics = None
+    if MOTION_DETECTION_AVAILABLE and task.motion_detection_config is not None:
+        motion_result = episode.motion_detection_result
+        quality_metrics = create_episode_quality_metrics(
+            episode_index=task.episode_index,
+            source=episode.source,
+            original_length=episode.camera_frame_count,
+            final_length=len(df),
+            idle_prefix_frames=motion_result.idle_prefix_frames if motion_result else 0,
+            idle_suffix_frames=motion_result.idle_suffix_frames if motion_result else 0,
+            fps=episode_fps,
+            max_skew_sec=episode.max_skew,
+            skew_warning_threshold=task.max_time_skew,
+            mean_eef_velocity=motion_result.mean_eef_velocity if motion_result else 0.0,
+            max_eef_velocity=motion_result.max_eef_velocity if motion_result else 0.0,
+            mean_action_state_diff=motion_result.mean_action_state_diff if motion_result else 0.0,
+            camera_frame_count=episode.camera_frame_count,
+            head_rgb_frames=episode.videos.get("head_rgb"),
+        )
+
     return EpisodeConversionResult(
         episode_index=task.episode_index,
         length=len(df),
@@ -1050,6 +1158,9 @@ def _write_episode_outputs(task: EpisodeConversionTask) -> EpisodeConversionResu
         video_shapes=episode.video_shapes,
         parquet_path=parquet_path,
         written_global_start_index=task.global_start_index,
+        original_length=episode.camera_frame_count,
+        motion_detection_result=episode.motion_detection_result,
+        quality_metrics=quality_metrics,
     )
 
 
@@ -1059,6 +1170,19 @@ def _rewrite_parquet_global_index(
     length: int,
 ) -> None:
     df = pd.read_parquet(parquet_path)
+    df["index"] = np.arange(global_start_index, global_start_index + length, dtype=np.int64)
+    df.to_parquet(parquet_path, index=False)
+
+
+def _rewrite_parquet_episode_indices(
+    parquet_path: Path,
+    episode_index: int,
+    global_start_index: int,
+) -> None:
+    df = pd.read_parquet(parquet_path)
+    length = len(df)
+    df["episode_index"] = np.full(length, episode_index, dtype=np.int64)
+    df["frame_index"] = np.arange(length, dtype=np.int64)
     df["index"] = np.arange(global_start_index, global_start_index + length, dtype=np.int64)
     df.to_parquet(parquet_path, index=False)
 
@@ -1085,6 +1209,195 @@ def _episode_metadata(
             "video_topics": {key: topics[key] for key in VIDEO_TOPIC_KEYS},
         },
     }
+
+
+def _quality_filter_reasons(metrics: Any, max_skew_threshold: float) -> list[str]:
+    reasons = [
+        reason for reason in metrics.filter_reasons if not str(reason).startswith("max_skew")
+    ]
+    if metrics.max_skew_sec > max_skew_threshold:
+        reasons.append(
+            f"max_skew ({metrics.max_skew_sec:.4f}s) > threshold ({max_skew_threshold}s)"
+        )
+    return reasons
+
+
+def _move_episode_files(
+    output_dir: Path,
+    episode_index: int,
+    chunks_size: int,
+    dest_root: Path,
+) -> None:
+    episode_chunk = episode_index // chunks_size
+
+    data_file = (
+        output_dir / "data" / f"chunk-{episode_chunk:03d}" / f"episode_{episode_index:06d}.parquet"
+    )
+    dest_data_dir = dest_root / "data" / f"chunk-{episode_chunk:03d}"
+    dest_data_dir.mkdir(parents=True, exist_ok=True)
+    if data_file.exists():
+        shutil.move(str(data_file), str(dest_data_dir / data_file.name))
+
+    video_base = output_dir / "videos" / f"chunk-{episode_chunk:03d}"
+    dest_video_dir = dest_root / "videos" / f"chunk-{episode_chunk:03d}"
+    for modality_key in VIDEO_MODALITY_KEYS.values():
+        video_file = (
+            video_base
+            / f"observation.images.{modality_key}"
+            / f"episode_{episode_index:06d}.mp4"
+        )
+        if video_file.exists():
+            dest_video_subdir = dest_video_dir / f"observation.images.{modality_key}"
+            dest_video_subdir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(video_file), str(dest_video_subdir / video_file.name))
+
+
+def _move_kept_episode_to_compact_index(
+    output_dir: Path,
+    result: EpisodeConversionResult,
+    new_episode_index: int,
+    new_global_start_index: int,
+    chunks_size: int,
+) -> EpisodeConversionResult:
+    old_episode_index = result.episode_index
+    old_chunk = old_episode_index // chunks_size
+    new_chunk = new_episode_index // chunks_size
+
+    old_parquet = (
+        output_dir / "data" / f"chunk-{old_chunk:03d}" / f"episode_{old_episode_index:06d}.parquet"
+    )
+    new_parquet = (
+        output_dir / "data" / f"chunk-{new_chunk:03d}" / f"episode_{new_episode_index:06d}.parquet"
+    )
+    new_parquet.parent.mkdir(parents=True, exist_ok=True)
+    if old_parquet != new_parquet:
+        shutil.move(str(old_parquet), str(new_parquet))
+
+    for modality_key in VIDEO_MODALITY_KEYS.values():
+        old_video = (
+            output_dir
+            / "videos"
+            / f"chunk-{old_chunk:03d}"
+            / f"observation.images.{modality_key}"
+            / f"episode_{old_episode_index:06d}.mp4"
+        )
+        new_video = (
+            output_dir
+            / "videos"
+            / f"chunk-{new_chunk:03d}"
+            / f"observation.images.{modality_key}"
+            / f"episode_{new_episode_index:06d}.mp4"
+        )
+        new_video.parent.mkdir(parents=True, exist_ok=True)
+        if old_video != new_video:
+            shutil.move(str(old_video), str(new_video))
+
+    _rewrite_parquet_episode_indices(
+        new_parquet,
+        episode_index=new_episode_index,
+        global_start_index=new_global_start_index,
+    )
+
+    return replace(
+        result,
+        episode_index=new_episode_index,
+        parquet_path=new_parquet,
+        written_global_start_index=new_global_start_index,
+    )
+
+
+def _filter_and_compact_episodes_by_quality(
+    output_dir: Path,
+    results: list[EpisodeConversionResult],
+    quality_metrics: list[Any],
+    max_skew_threshold: float,
+    chunks_size: int,
+) -> tuple[list[EpisodeConversionResult], list[Any], int]:
+    """Move failed episodes out and compact kept episode ids plus global frame indices."""
+    metrics_by_episode = {metrics.episode_index: metrics for metrics in quality_metrics}
+    failed_reasons = {
+        result.episode_index: _quality_filter_reasons(
+            metrics_by_episode[result.episode_index], max_skew_threshold
+        )
+        for result in results
+        if result.episode_index in metrics_by_episode
+    }
+    failed_reasons = {episode: reasons for episode, reasons in failed_reasons.items() if reasons}
+
+    if not failed_reasons:
+        print("  ✓ All episodes passed quality checks")
+        return results, quality_metrics, sum(result.length for result in results)
+
+    filtered_out_dir = output_dir / "filtered_out"
+    filtered_out_dir.mkdir(parents=True, exist_ok=True)
+
+    filter_report = []
+    for result in results:
+        if result.episode_index not in failed_reasons:
+            continue
+        metrics = metrics_by_episode.get(result.episode_index)
+        _move_episode_files(
+            output_dir,
+            episode_index=result.episode_index,
+            chunks_size=chunks_size,
+            dest_root=filtered_out_dir,
+        )
+        filter_report.append(
+            {
+                "episode_index": result.episode_index,
+                "source": result.source,
+                "reasons": failed_reasons[result.episode_index],
+                "max_skew_sec": metrics.max_skew_sec if metrics else result.max_skew,
+                "final_length": result.length,
+            }
+        )
+
+    kept_results = []
+    kept_quality_metrics = []
+    global_frame_index = 0
+    for new_episode_index, result in enumerate(
+        result for result in results if result.episode_index not in failed_reasons
+    ):
+        compact_result = _move_kept_episode_to_compact_index(
+            output_dir,
+            result,
+            new_episode_index=new_episode_index,
+            new_global_start_index=global_frame_index,
+            chunks_size=chunks_size,
+        )
+        kept_results.append(compact_result)
+
+        metrics = metrics_by_episode.get(result.episode_index)
+        if metrics is not None:
+            kept_quality_metrics.append(
+                replace(
+                    metrics,
+                    episode_index=new_episode_index,
+                    passed_filter=True,
+                    filter_reasons=[],
+                )
+            )
+        global_frame_index += result.length
+
+    filter_report_path = filtered_out_dir / "filter_report.json"
+    with filter_report_path.open("w", encoding="utf-8") as f:
+        json.dump(filter_report, f, indent=2)
+
+    print(f"  ✓ Moved {len(filter_report)} failed episodes to {filtered_out_dir}")
+    print(
+        f"  ✓ Compacted kept episodes to {len(kept_results)} episodes / "
+        f"{global_frame_index} frames"
+    )
+    print(f"  ✓ Wrote filter report to {filter_report_path}")
+    print(f"\n  Failed episodes breakdown:")
+    for reason_key in ["max_skew", "too short", "low motion"]:
+        count = sum(
+            1 for reasons in failed_reasons.values() if any(reason_key in r for r in reasons)
+        )
+        if count > 0:
+            print(f"    - {reason_key}: {count} episodes")
+
+    return kept_results, kept_quality_metrics, global_frame_index
 
 
 def _print_episode_summary(
@@ -1132,6 +1445,7 @@ def _make_episode_task(
     work_dir: Path | None,
     image_size: tuple[int, int] | None,
     global_start_index: int,
+    motion_detection_config: Any | None,
 ) -> EpisodeConversionTask:
     return EpisodeConversionTask(
         episode_index=episode_index,
@@ -1147,6 +1461,7 @@ def _make_episode_task(
         image_size=image_size,
         chunks_size=args.chunks_size,
         global_start_index=global_start_index,
+        motion_detection_config=motion_detection_config,
     )
 
 
@@ -1157,18 +1472,21 @@ def _convert_episodes_sequential(
     topics: dict[str, str],
     work_dir: Path | None,
     image_size: tuple[int, int] | None,
+    motion_detection_config: Any | None,
 ) -> tuple[
-    list[dict[str, Any]],
+    list[EpisodeConversionResult],
     list[float],
     int,
     dict[str, list[str]] | None,
     dict[str, tuple[int, int, int]] | None,
+    list[Any],
 ]:
     global_frame_index = 0
-    episodes_meta = []
+    results = []
     episode_fps_values = []
     hand_feature_names = None
     video_shapes = None
+    quality_metrics_list = []
 
     for episode_index, bag_dir in enumerate(bag_dirs):
         task = _make_episode_task(
@@ -1180,6 +1498,7 @@ def _convert_episodes_sequential(
             work_dir=work_dir,
             image_size=image_size,
             global_start_index=global_frame_index,
+            motion_detection_config=motion_detection_config,
         )
         result = _write_episode_outputs(task)
         hand_feature_names, video_shapes = _validate_common_episode_metadata(
@@ -1187,20 +1506,21 @@ def _convert_episodes_sequential(
             hand_feature_names,
             video_shapes,
         )
-        episodes_meta.append(
-            _episode_metadata(
-                result,
-                args.task_description,
-                args.timestamp_source,
-                args.max_time_skew,
-                topics,
-            )
-        )
+        results.append(result)
         episode_fps_values.append(result.fps)
+        if result.quality_metrics:
+            quality_metrics_list.append(result.quality_metrics)
         _print_episode_summary(result, bag_dir.name, args.max_time_skew)
         global_frame_index += result.length
 
-    return episodes_meta, episode_fps_values, global_frame_index, hand_feature_names, video_shapes
+    return (
+        results,
+        episode_fps_values,
+        global_frame_index,
+        hand_feature_names,
+        video_shapes,
+        quality_metrics_list,
+    )
 
 
 def _convert_episodes_parallel(
@@ -1210,12 +1530,14 @@ def _convert_episodes_parallel(
     topics: dict[str, str],
     work_dir: Path | None,
     image_size: tuple[int, int] | None,
+    motion_detection_config: Any | None,
 ) -> tuple[
-    list[dict[str, Any]],
+    list[EpisodeConversionResult],
     list[float],
     int,
     dict[str, list[str]] | None,
     dict[str, tuple[int, int, int]] | None,
+    list[Any],
 ]:
     tasks = [
         _make_episode_task(
@@ -1227,6 +1549,7 @@ def _convert_episodes_parallel(
             work_dir=_parallel_episode_work_dir(work_dir, episode_index),
             image_size=image_size,
             global_start_index=0,
+            motion_detection_config=motion_detection_config,
         )
         for episode_index, bag_dir in enumerate(bag_dirs)
     ]
@@ -1234,10 +1557,11 @@ def _convert_episodes_parallel(
     pending_results: dict[int, EpisodeConversionResult] = {}
     next_to_finalize = 0
     global_frame_index = 0
-    episodes_meta = []
+    results = []
     episode_fps_values = []
     hand_feature_names = None
     video_shapes = None
+    quality_metrics_list = []
 
     with ProcessPoolExecutor(max_workers=args.num_workers) as executor:
         futures = {executor.submit(_write_episode_outputs, task): task for task in tasks}
@@ -1258,23 +1582,24 @@ def _convert_episodes_parallel(
                     hand_feature_names,
                     video_shapes,
                 )
-                episodes_meta.append(
-                    _episode_metadata(
-                        result,
-                        args.task_description,
-                        args.timestamp_source,
-                        args.max_time_skew,
-                        topics,
-                    )
-                )
+                results.append(result)
                 episode_fps_values.append(result.fps)
+                if result.quality_metrics:
+                    quality_metrics_list.append(result.quality_metrics)
                 _print_episode_summary(
                     result, bag_dirs[result.episode_index].name, args.max_time_skew
                 )
                 global_frame_index += result.length
                 next_to_finalize += 1
 
-    return episodes_meta, episode_fps_values, global_frame_index, hand_feature_names, video_shapes
+    return (
+        results,
+        episode_fps_values,
+        global_frame_index,
+        hand_feature_names,
+        video_shapes,
+        quality_metrics_list,
+    )
 
 
 def convert(args: argparse.Namespace) -> None:
@@ -1314,13 +1639,31 @@ def convert(args: argparse.Namespace) -> None:
     if args.num_workers < 1:
         raise ValueError("--num-workers must be >= 1")
 
+    # Configure motion detection
+    motion_detection_config = None
+    if args.enable_motion_detection:
+        if not MOTION_DETECTION_AVAILABLE:
+            print("⚠ Motion detection modules not available, proceeding without motion detection")
+        else:
+            motion_detection_config = MotionDetectionConfig(
+                velocity_threshold=args.motion_velocity_threshold,
+                hand_velocity_threshold=args.motion_hand_velocity_threshold,
+                action_state_diff_threshold=args.motion_action_state_diff_threshold,
+                window_duration_sec=args.motion_window_sec,
+                min_motion_frames=args.motion_min_frames,
+                fps=args.output_fps if args.output_fps else 30.0,
+            )
+            print(f"Motion detection enabled: velocity_threshold={args.motion_velocity_threshold} m/s, "
+                  f"window={args.motion_window_sec}s")
+
     if args.num_workers == 1:
         (
-            episodes_meta,
+            results,
             episode_fps_values,
             global_frame_index,
             hand_feature_names,
             video_shapes,
+            quality_metrics_list,
         ) = _convert_episodes_sequential(
             bag_dirs=bag_dirs,
             args=args,
@@ -1328,15 +1671,17 @@ def convert(args: argparse.Namespace) -> None:
             topics=topics,
             work_dir=work_dir,
             image_size=image_size,
+            motion_detection_config=motion_detection_config,
         )
     else:
         print(f"Converting {len(bag_dirs)} episodes with {args.num_workers} worker processes")
         (
-            episodes_meta,
+            results,
             episode_fps_values,
             global_frame_index,
             hand_feature_names,
             video_shapes,
+            quality_metrics_list,
         ) = _convert_episodes_parallel(
             bag_dirs=bag_dirs,
             args=args,
@@ -1344,7 +1689,36 @@ def convert(args: argparse.Namespace) -> None:
             topics=topics,
             work_dir=work_dir,
             image_size=image_size,
+            motion_detection_config=motion_detection_config,
         )
+
+    if quality_metrics_list and MOTION_DETECTION_AVAILABLE and args.filter_by_quality:
+        print("\nFiltering episodes by quality...")
+        filter_threshold = (
+            args.quality_max_skew if args.quality_max_skew is not None else args.max_time_skew
+        )
+        results, quality_metrics_list, global_frame_index = _filter_and_compact_episodes_by_quality(
+            output_dir,
+            results,
+            quality_metrics_list,
+            filter_threshold,
+            args.chunks_size,
+        )
+        episode_fps_values = [result.fps for result in results]
+
+    if not results:
+        raise ValueError("No episodes remain after conversion/filtering.")
+
+    episodes_meta = [
+        _episode_metadata(
+            result,
+            args.task_description,
+            args.timestamp_source,
+            args.max_time_skew,
+            topics,
+        )
+        for result in results
+    ]
 
     metadata_fps = args.output_fps or float(np.median(np.asarray(episode_fps_values)))
     _write_metadata(
@@ -1364,6 +1738,65 @@ def convert(args: argparse.Namespace) -> None:
     )
     print(f"Wrote {len(episodes_meta)} episodes / {global_frame_index} frames to {output_dir}")
 
+    # Write quality report if motion detection was enabled
+    if quality_metrics_list and MOTION_DETECTION_AVAILABLE:
+        print("\nGenerating quality report...")
+        summary = create_dataset_summary(quality_metrics_list)
+        write_quality_report(output_dir, quality_metrics_list, summary)
+
+    if args.generate_stats:
+        print("\nGenerating dataset statistics...")
+        try:
+            from gr00t.data.stats import generate_stats, generate_rel_stats
+            from gr00t.data.types import EmbodimentTag
+
+            if args.modality_config_path:
+                import importlib
+                import sys
+
+                config_path = Path(args.modality_config_path).expanduser().resolve()
+                if config_path.exists() and config_path.suffix == ".py":
+                    sys.path.insert(0, str(config_path.parent))
+                    importlib.import_module(config_path.stem)
+                    print(f"  - Loaded modality config: {config_path}")
+                else:
+                    raise FileNotFoundError(
+                        f"Modality config does not exist or is not a .py file: {args.modality_config_path}"
+                    )
+
+            print("  - Generating stats.json...")
+            generate_stats(output_dir)
+            print(f"    ✓ Wrote {output_dir / 'meta' / 'stats.json'}")
+
+            if args.embodiment_tag:
+                print(f"  - Generating relative_stats.json for {args.embodiment_tag}...")
+                try:
+                    embodiment_tag = EmbodimentTag(args.embodiment_tag)
+                    generate_rel_stats(output_dir, embodiment_tag)
+                    print(f"    ✓ Wrote {output_dir / 'meta' / 'relative_stats.json'}")
+                except ValueError as e:
+                    print(f"    ⚠ Skipping relative_stats.json: invalid embodiment tag {args.embodiment_tag}")
+                    print(f"      Error: {e}")
+            else:
+                print("  - Skipping relative_stats.json (no --embodiment-tag provided)")
+                print("    Hint: Use --embodiment-tag NEW_EMBODIMENT with --modality-config-path")
+        except ImportError as e:
+            print(f"  ⚠ Could not import stats generation modules: {e}")
+            print("    Run stats generation manually in a different environment:")
+            print(f"    python gr00t/data/stats.py --dataset-path {output_dir} --embodiment-tag NEW_EMBODIMENT --modality-config-path {args.modality_config_path}")
+    else:
+        print("\nSkipping automatic stats generation (use --generate-stats to enable)")
+        print("To generate stats manually, run in your gr00t environment:")
+        if args.modality_config_path:
+            print(f"  python gr00t/data/stats.py \\")
+            print(f"    --dataset-path {output_dir} \\")
+            print(f"    --embodiment-tag NEW_EMBODIMENT \\")
+            print(f"    --modality-config-path {args.modality_config_path}")
+        else:
+            print(f"  python gr00t/data/stats.py \\")
+            print(f"    --dataset-path {output_dir} \\")
+            print(f"    --embodiment-tag NEW_EMBODIMENT")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1382,6 +1815,84 @@ def parse_args() -> argparse.Namespace:
         choices=["rotvec", "rot6d"],
         default="rotvec",
         help="EEF pose layout in observation.state/action.",
+    )
+    parser.add_argument(
+        "--embodiment-tag",
+        default=None,
+        help=(
+            "Embodiment tag for generating relative_stats.json (e.g., "
+            "WUJI_ASTRIBOT_EEF_HAND_ROT6D or WUJI_ASTRIBOT_EEF_HAND_ROTVEC). "
+            "If not provided, only stats.json will be generated."
+        ),
+    )
+    parser.add_argument(
+        "--modality-config-path",
+        default=None,
+        help=(
+            "Path to a .py modality config file for custom embodiment tags. "
+            "Required for tags not in the built-in MODALITY_CONFIGS registry. "
+            "Example: examples/wuji_rot6d/wuji_eef_hand_rot6d_config.py"
+        ),
+    )
+    parser.add_argument(
+        "--skip-stats",
+        action="store_true",
+        default=True,
+        help="Skip automatic stats.json and relative_stats.json generation after conversion (default: True).",
+    )
+    parser.add_argument(
+        "--generate-stats",
+        action="store_true",
+        default=False,
+        help="Enable automatic stats generation (requires gr00t package installed).",
+    )
+    parser.add_argument(
+        "--filter-by-quality",
+        action="store_true",
+        default=False,
+        help="Move episodes that fail quality checks to a separate 'filtered_out' directory.",
+    )
+    parser.add_argument(
+        "--quality-max-skew",
+        type=float,
+        default=None,
+        help="Override max_time_skew threshold for quality filtering (default: use --max-time-skew value).",
+    )
+    parser.add_argument(
+        "--enable-motion-detection",
+        action="store_true",
+        default=False,
+        help="Enable motion detection to trim idle frames at start/end of episodes.",
+    )
+    parser.add_argument(
+        "--motion-velocity-threshold",
+        type=float,
+        default=0.01,
+        help="Combined EEF velocity threshold (m/s) for motion detection. Default: 0.01",
+    )
+    parser.add_argument(
+        "--motion-hand-velocity-threshold",
+        type=float,
+        default=0.05,
+        help="Hand joint velocity threshold (rad/s) for motion detection. Default: 0.05",
+    )
+    parser.add_argument(
+        "--motion-action-state-diff-threshold",
+        type=float,
+        default=0.02,
+        help="Action-state difference threshold for motion detection. Default: 0.02",
+    )
+    parser.add_argument(
+        "--motion-window-sec",
+        type=float,
+        default=0.5,
+        help="Sliding window duration (seconds) for motion detection smoothing. Default: 0.5",
+    )
+    parser.add_argument(
+        "--motion-min-frames",
+        type=int,
+        default=30,
+        help="Minimum number of frames to consider valid motion. Default: 30",
     )
     parser.add_argument(
         "--fps",
