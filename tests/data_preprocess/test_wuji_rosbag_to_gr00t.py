@@ -2,9 +2,13 @@ from types import SimpleNamespace
 
 from data_preprocess.wuji_rosbag_to_gr00t import (
     DEFAULT_TOPICS,
+    LowPassFilterConfig,
     TimedSample,
+    _apply_low_pass_filter,
     _align_episode,
     _joint_sample,
+    _low_pass_filter_samples,
+    _make_low_pass_filter_config,
     _message_timestamp,
     _prepare_video_frame,
     _rewrite_parquet_global_index,
@@ -142,6 +146,60 @@ def test_parse_args_accepts_num_workers(monkeypatch):
     args = parse_args()
 
     assert args.num_workers == 3
+
+
+def test_low_pass_filter_samples_uses_ema_formula():
+    samples = [
+        TimedSample(0.0, np.array([0.0, 10.0], dtype=np.float32)),
+        TimedSample(1.0, np.array([10.0, 20.0], dtype=np.float32)),
+        TimedSample(2.0, np.array([20.0, 30.0], dtype=np.float32)),
+    ]
+
+    filtered = _low_pass_filter_samples(samples, filter_scale=0.3)
+
+    np.testing.assert_allclose(filtered[0].value, np.array([0.0, 10.0], dtype=np.float32))
+    np.testing.assert_allclose(filtered[1].value, np.array([3.0, 13.0], dtype=np.float32))
+    np.testing.assert_allclose(filtered[2].value, np.array([8.1, 18.1], dtype=np.float32))
+    assert [sample.timestamp for sample in filtered] == [0.0, 1.0, 2.0]
+
+
+def test_apply_low_pass_filter_only_filters_configured_streams():
+    streams = {
+        "left_eef_action": [
+            TimedSample(0.0, np.array([0.0], dtype=np.float32)),
+            TimedSample(1.0, np.array([10.0], dtype=np.float32)),
+        ],
+        "left_eef_state": [
+            TimedSample(0.0, np.array([0.0], dtype=np.float32)),
+            TimedSample(1.0, np.array([10.0], dtype=np.float32)),
+        ],
+    }
+
+    filtered = _apply_low_pass_filter(
+        streams,
+        LowPassFilterConfig(filter_scale=0.5, streams=("left_eef_action",)),
+    )
+
+    np.testing.assert_allclose(filtered["left_eef_action"][1].value, np.array([5.0]))
+    np.testing.assert_allclose(filtered["left_eef_state"][1].value, np.array([10.0]))
+
+
+def test_parse_args_accepts_low_pass_filter_options(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "wuji_rosbag_to_gr00t.py",
+            "--enable-low-pass-filter",
+            "--filter-scale",
+            "0.1",
+            "--low-pass-filter-stream",
+            "left_hand_action",
+        ],
+    )
+
+    config = _make_low_pass_filter_config(parse_args())
+
+    assert config == LowPassFilterConfig(filter_scale=0.1, streams=("left_hand_action",))
 
 
 def test_rewrite_parquet_global_index_updates_index_column(tmp_path):

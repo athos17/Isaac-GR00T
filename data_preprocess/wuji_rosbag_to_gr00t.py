@@ -109,6 +109,22 @@ VIDEO_MODALITY_KEYS = {
 }
 
 STATE_KEYS = ["left_eef", "right_eef", "left_hand_joints", "right_hand_joints"]
+DEFAULT_LOW_PASS_FILTER_STREAMS = (
+    "left_eef_action",
+    "right_eef_action",
+    "left_hand_action",
+    "right_hand_action",
+)
+FILTERABLE_STREAM_KEYS = (
+    "left_eef_state",
+    "right_eef_state",
+    "left_eef_action",
+    "right_eef_action",
+    "left_hand_state",
+    "right_hand_state",
+    "left_hand_action",
+    "right_hand_action",
+)
 TimestampSource = Literal["header", "rosbag"]
 
 CUSTOM_MSG_DEFINITIONS = {
@@ -129,6 +145,12 @@ astribot_msgs/RobotCartesianState[] states
 class TimedSample:
     timestamp: float
     value: np.ndarray
+
+
+@dataclass(frozen=True)
+class LowPassFilterConfig:
+    filter_scale: float
+    streams: tuple[str, ...] = DEFAULT_LOW_PASS_FILTER_STREAMS
 
 
 @dataclass
@@ -160,6 +182,7 @@ class EpisodeConversionTask:
     image_size: tuple[int, int] | None
     chunks_size: int
     global_start_index: int
+    low_pass_filter_config: LowPassFilterConfig | None = None
     motion_detection_config: Any | None = None  # MotionDetectionConfig if enabled
 
 
@@ -530,6 +553,50 @@ def _to_timed_samples(
     return samples
 
 
+def _low_pass_filter_samples(samples: list[TimedSample], filter_scale: float) -> list[TimedSample]:
+    if not samples:
+        return []
+    if not 0.0 <= filter_scale <= 1.0:
+        raise ValueError(f"filter_scale must be in [0, 1], got {filter_scale}")
+
+    filtered_samples = []
+    previous = np.asarray(samples[0].value, dtype=np.float32).copy()
+    filtered_samples.append(TimedSample(samples[0].timestamp, previous.copy()))
+    for sample in samples[1:]:
+        current = np.asarray(sample.value, dtype=np.float32)
+        if current.shape != previous.shape:
+            raise ValueError(
+                "Cannot low-pass filter samples with changing dimensions: "
+                f"previous={previous.shape}, current={current.shape}"
+            )
+        previous = (1.0 - filter_scale) * previous + filter_scale * current
+        filtered_samples.append(TimedSample(sample.timestamp, previous.astype(np.float32)))
+    return filtered_samples
+
+
+def _apply_low_pass_filter(
+    streams: dict[str, list[TimedSample]],
+    config: LowPassFilterConfig | None,
+) -> dict[str, list[TimedSample]]:
+    if config is None:
+        return streams
+
+    unknown = sorted(set(config.streams) - set(FILTERABLE_STREAM_KEYS))
+    if unknown:
+        raise ValueError(
+            f"Unknown low-pass filter streams: {unknown}. "
+            f"Valid streams are: {sorted(FILTERABLE_STREAM_KEYS)}"
+        )
+
+    filtered_streams = dict(streams)
+    for stream in config.streams:
+        filtered_streams[stream] = _low_pass_filter_samples(
+            filtered_streams[stream],
+            config.filter_scale,
+        )
+    return filtered_streams
+
+
 def _nearest_sample(
     samples: list[TimedSample], timestamp: float, cursor: int
 ) -> tuple[TimedSample, int, float]:
@@ -566,6 +633,7 @@ def _build_streams(
     work_dir: Path | None,
     bag_backend: str,
     timestamp_source: TimestampSource,
+    low_pass_filter_config: LowPassFilterConfig | None = None,
 ) -> tuple[dict[str, list[TimedSample]], dict[str, list[str]]]:
     required_topics = set(topics.values())
     raw = _read_bag_messages(
@@ -635,6 +703,7 @@ def _build_streams(
             _decode_image_sample,
         ),
     }
+    streams = _apply_low_pass_filter(streams, low_pass_filter_config)
     empty = [name for name, samples in streams.items() if not samples]
     if empty:
         raise ValueError(f"{bag_dir} has no readable samples for streams: {empty}")
@@ -672,6 +741,7 @@ def _align_episode(
     work_dir: Path | None,
     bag_backend: str,
     timestamp_source: TimestampSource,
+    low_pass_filter_config: LowPassFilterConfig | None = None,
     motion_detection_config: Any | None = None,
 ) -> AlignedEpisode:
     streams, hand_feature_names = _build_streams(
@@ -681,6 +751,7 @@ def _align_episode(
         work_dir=work_dir,
         bag_backend=bag_backend,
         timestamp_source=timestamp_source,
+        low_pass_filter_config=low_pass_filter_config,
     )
 
     common_start, common_end = _common_time_window(streams)
@@ -1070,6 +1141,22 @@ def _validate_metadata_topics(bag_dir: Path, topics: dict[str, str]) -> None:
         raise ValueError(f"{bag_dir} has required topics with zero messages: {empty}")
 
 
+def _make_low_pass_filter_config(args: argparse.Namespace) -> LowPassFilterConfig | None:
+    if not args.enable_low_pass_filter:
+        return None
+    if not 0.0 <= args.filter_scale <= 1.0:
+        raise ValueError(f"--filter-scale must be in [0, 1], got {args.filter_scale}")
+
+    streams = tuple(args.low_pass_filter_stream or DEFAULT_LOW_PASS_FILTER_STREAMS)
+    unknown = sorted(set(streams) - set(FILTERABLE_STREAM_KEYS))
+    if unknown:
+        raise ValueError(
+            f"Unknown --low-pass-filter-stream values: {unknown}. "
+            f"Valid values are: {sorted(FILTERABLE_STREAM_KEYS)}"
+        )
+    return LowPassFilterConfig(filter_scale=args.filter_scale, streams=streams)
+
+
 def _episode_data_dir(output_dir: Path, episode_index: int, chunks_size: int) -> Path:
     episode_chunk = episode_index // chunks_size
     return output_dir / "data" / f"chunk-{episode_chunk:03d}"
@@ -1095,6 +1182,7 @@ def _write_episode_outputs(task: EpisodeConversionTask) -> EpisodeConversionResu
         work_dir=task.work_dir,
         bag_backend=task.bag_backend,
         timestamp_source=task.timestamp_source,
+        low_pass_filter_config=task.low_pass_filter_config,
         motion_detection_config=task.motion_detection_config,
     )
     episode_fps = task.output_fps or _estimate_fps(episode.timestamps)
@@ -1193,8 +1281,9 @@ def _episode_metadata(
     timestamp_source: TimestampSource,
     max_time_skew: float,
     topics: dict[str, str],
+    low_pass_filter_config: LowPassFilterConfig | None,
 ) -> dict[str, Any]:
-    return {
+    metadata = {
         "episode_index": result.episode_index,
         "tasks": [task_description],
         "length": result.length,
@@ -1209,6 +1298,13 @@ def _episode_metadata(
             "video_topics": {key: topics[key] for key in VIDEO_TOPIC_KEYS},
         },
     }
+    if low_pass_filter_config is not None:
+        metadata["low_pass_filter"] = {
+            "filter_scale": low_pass_filter_config.filter_scale,
+            "streams": list(low_pass_filter_config.streams),
+            "formula": "filtered_t = (1 - filter_scale) * filtered_{t-1} + filter_scale * value_t",
+        }
+    return metadata
 
 
 def _quality_filter_reasons(metrics: Any, max_skew_threshold: float) -> list[str]:
@@ -1445,6 +1541,7 @@ def _make_episode_task(
     work_dir: Path | None,
     image_size: tuple[int, int] | None,
     global_start_index: int,
+    low_pass_filter_config: LowPassFilterConfig | None,
     motion_detection_config: Any | None,
 ) -> EpisodeConversionTask:
     return EpisodeConversionTask(
@@ -1461,6 +1558,7 @@ def _make_episode_task(
         image_size=image_size,
         chunks_size=args.chunks_size,
         global_start_index=global_start_index,
+        low_pass_filter_config=low_pass_filter_config,
         motion_detection_config=motion_detection_config,
     )
 
@@ -1472,6 +1570,7 @@ def _convert_episodes_sequential(
     topics: dict[str, str],
     work_dir: Path | None,
     image_size: tuple[int, int] | None,
+    low_pass_filter_config: LowPassFilterConfig | None,
     motion_detection_config: Any | None,
 ) -> tuple[
     list[EpisodeConversionResult],
@@ -1498,6 +1597,7 @@ def _convert_episodes_sequential(
             work_dir=work_dir,
             image_size=image_size,
             global_start_index=global_frame_index,
+            low_pass_filter_config=low_pass_filter_config,
             motion_detection_config=motion_detection_config,
         )
         result = _write_episode_outputs(task)
@@ -1530,6 +1630,7 @@ def _convert_episodes_parallel(
     topics: dict[str, str],
     work_dir: Path | None,
     image_size: tuple[int, int] | None,
+    low_pass_filter_config: LowPassFilterConfig | None,
     motion_detection_config: Any | None,
 ) -> tuple[
     list[EpisodeConversionResult],
@@ -1549,6 +1650,7 @@ def _convert_episodes_parallel(
             work_dir=_parallel_episode_work_dir(work_dir, episode_index),
             image_size=image_size,
             global_start_index=0,
+            low_pass_filter_config=low_pass_filter_config,
             motion_detection_config=motion_detection_config,
         )
         for episode_index, bag_dir in enumerate(bag_dirs)
@@ -1639,6 +1741,14 @@ def convert(args: argparse.Namespace) -> None:
     if args.num_workers < 1:
         raise ValueError("--num-workers must be >= 1")
 
+    low_pass_filter_config = _make_low_pass_filter_config(args)
+    if low_pass_filter_config is not None:
+        print(
+            "Low-pass filter enabled: "
+            f"filter_scale={low_pass_filter_config.filter_scale}, "
+            f"streams={', '.join(low_pass_filter_config.streams)}"
+        )
+
     # Configure motion detection
     motion_detection_config = None
     if args.enable_motion_detection:
@@ -1671,6 +1781,7 @@ def convert(args: argparse.Namespace) -> None:
             topics=topics,
             work_dir=work_dir,
             image_size=image_size,
+            low_pass_filter_config=low_pass_filter_config,
             motion_detection_config=motion_detection_config,
         )
     else:
@@ -1689,6 +1800,7 @@ def convert(args: argparse.Namespace) -> None:
             topics=topics,
             work_dir=work_dir,
             image_size=image_size,
+            low_pass_filter_config=low_pass_filter_config,
             motion_detection_config=motion_detection_config,
         )
 
@@ -1716,6 +1828,7 @@ def convert(args: argparse.Namespace) -> None:
             args.timestamp_source,
             args.max_time_skew,
             topics,
+            low_pass_filter_config,
         )
         for result in results
     ]
@@ -1863,6 +1976,34 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help="Enable motion detection to trim idle frames at start/end of episodes.",
+    )
+    parser.add_argument(
+        "--enable-low-pass-filter",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable first-order low-pass/EMA filtering before timestamp alignment. "
+            "Defaults to filtering the four action streams only."
+        ),
+    )
+    parser.add_argument(
+        "--filter-scale",
+        type=float,
+        default=0.3,
+        help=(
+            "Low-pass filter alpha in [0, 1]. Higher tracks new commands faster; "
+            "lower is smoother but more delayed. Default: 0.3"
+        ),
+    )
+    parser.add_argument(
+        "--low-pass-filter-stream",
+        action="append",
+        default=None,
+        help=(
+            "Stream key to low-pass filter. Can be repeated. Defaults to action streams: "
+            f"{', '.join(DEFAULT_LOW_PASS_FILTER_STREAMS)}. "
+            f"Valid values: {', '.join(FILTERABLE_STREAM_KEYS)}."
+        ),
     )
     parser.add_argument(
         "--motion-velocity-threshold",
