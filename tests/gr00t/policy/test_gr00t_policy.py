@@ -70,22 +70,44 @@ def policy():
     mock_processor.max_action_horizon = 50
     mock_processor.eval = MagicMock()
     mock_processor.training = False
-    mock_processor.collator = MagicMock()
+    def fake_process_messages(messages):
+        return {
+            "state": torch.randn(1, 128),
+            "embodiment_id": torch.zeros((), dtype=torch.long),
+            "input_ids": torch.ones(10, dtype=torch.long),
+            "attention_mask": torch.ones(10, dtype=torch.long),
+            "pixel_values": torch.randn(3, 256, 256),
+            "image_grid_thw": torch.tensor([1, 16, 16]),
+            "messages": messages,
+        }
 
-    def fake_process_observation(observation, embodiment_tag):
-        return BatchFeature(
-            data={
-                "state": torch.randn(1, 1, 128),
-                "action_mask": torch.ones(1, 16, 128),
-                "embodiment_id": torch.zeros(1, dtype=torch.long),
-                "input_ids": torch.ones(1, 10, dtype=torch.long),
-                "attention_mask": torch.ones(1, 10, dtype=torch.long),
-                "pixel_values": torch.randn(1, 3, 256, 256),
-                "image_grid_thw": torch.tensor([[1, 16, 16]]),
-            }
-        )
+    mock_processor.side_effect = fake_process_messages
 
-    mock_processor.process_observation = MagicMock(side_effect=fake_process_observation)
+    def fake_collator(processed_inputs):
+        return {
+            "backbone_output": BatchFeature(
+                data={
+                    "input_ids": torch.stack([item["input_ids"] for item in processed_inputs]),
+                    "attention_mask": torch.stack(
+                        [item["attention_mask"] for item in processed_inputs]
+                    ),
+                    "pixel_values": torch.stack([item["pixel_values"] for item in processed_inputs]),
+                    "image_grid_thw": torch.stack(
+                        [item["image_grid_thw"] for item in processed_inputs]
+                    ),
+                }
+            ),
+            "action_input": BatchFeature(
+                data={
+                    "state": torch.stack([item["state"] for item in processed_inputs]).unsqueeze(1),
+                    "embodiment_id": torch.stack(
+                        [item["embodiment_id"] for item in processed_inputs]
+                    ),
+                }
+            ),
+        }
+
+    mock_processor.collator = MagicMock(side_effect=fake_collator)
 
     def fake_decode_action(action, embodiment_tag, state=None):
         return {k: np.zeros((1, 16, 1), dtype=np.float32) for k in ACTION_KEYS}
@@ -168,3 +190,46 @@ class TestGr00tPolicyGetAction:
         action, info = policy.get_action(obs)
         assert isinstance(action, dict)
         assert isinstance(info, dict)
+
+    def test_get_action_injects_rtc_leftover_and_forwards_model_options(self, policy):
+        obs = _make_observation()
+        prev_chunk_left_over = {
+            key: np.full((1, 4, 1), fill_value=index, dtype=np.float32)
+            for index, key in enumerate(ACTION_KEYS)
+        }
+        options = {
+            "rtc": {
+                "enabled": True,
+                "prev_chunk_left_over": prev_chunk_left_over,
+                "action_horizon": 4,
+                "rtc_overlap_steps": 3,
+                "rtc_frozen_steps": 1,
+                "rtc_ramp_rate": 2.5,
+            }
+        }
+
+        policy.get_action(obs, options=options)
+
+        messages = policy.processor.call_args.args[0]
+        vla_step_data = messages[0]["content"]
+        assert set(vla_step_data.actions) == set(ACTION_KEYS)
+        for index, key in enumerate(ACTION_KEYS):
+            assert vla_step_data.actions[key].shape == (4, 1)
+            np.testing.assert_array_equal(
+                vla_step_data.actions[key],
+                np.full((4, 1), fill_value=index, dtype=np.float32),
+            )
+
+        assert policy.model.get_action.call_args.kwargs["options"] == {
+            "action_horizon": 4,
+            "rtc_overlap_steps": 3,
+            "rtc_frozen_steps": 1,
+            "rtc_ramp_rate": 2.5,
+        }
+
+    def test_get_action_without_rtc_does_not_forward_model_options(self, policy):
+        obs = _make_observation()
+
+        policy.get_action(obs)
+
+        assert "options" not in policy.model.get_action.call_args.kwargs

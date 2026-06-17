@@ -310,6 +310,61 @@ class Gr00tN1d7ActionHead(nn.Module):
         return BatchFeature(data={"backbone_features": vl_embeds, "state_features": state_features})
 
     @torch.no_grad()
+    def _validate_rtc_options(
+        self,
+        action_input: BatchFeature,
+        options: dict[str, Any] | None,
+    ) -> dict[str, int | float]:
+        if options is None:
+            raise ValueError("RTC action input requires model options")
+
+        required_keys = (
+            "action_horizon",
+            "rtc_overlap_steps",
+            "rtc_frozen_steps",
+            "rtc_ramp_rate",
+        )
+        missing = [key for key in required_keys if key not in options]
+        if missing:
+            raise ValueError(f"RTC options missing required keys: {missing}")
+
+        action_horizon = int(options["action_horizon"])
+        overlap_steps = int(options["rtc_overlap_steps"])
+        frozen_steps = int(options["rtc_frozen_steps"])
+        ramp_rate = float(options["rtc_ramp_rate"])
+        action_tensor = action_input["action"]
+
+        if action_tensor.ndim != 3:
+            raise ValueError(f"RTC action input must have shape (B, T, D), got {action_tensor.shape}")
+        if action_horizon <= 0:
+            raise ValueError("action_horizon must be positive")
+        if action_horizon > action_tensor.shape[1]:
+            raise ValueError(
+                f"action_horizon={action_horizon} exceeds action input horizon {action_tensor.shape[1]}"
+            )
+        if overlap_steps < 0:
+            raise ValueError("rtc_overlap_steps must be non-negative")
+        if overlap_steps > action_horizon:
+            raise ValueError("rtc_overlap_steps must be <= action_horizon")
+        if overlap_steps > self.config.action_horizon:
+            raise ValueError(
+                f"rtc_overlap_steps={overlap_steps} exceeds model action horizon {self.config.action_horizon}"
+            )
+        if frozen_steps < 0:
+            raise ValueError("rtc_frozen_steps must be non-negative")
+        if frozen_steps > overlap_steps:
+            raise ValueError("rtc_frozen_steps must be <= rtc_overlap_steps")
+        if ramp_rate <= 0.0:
+            raise ValueError("rtc_ramp_rate must be positive")
+
+        return {
+            "action_horizon": action_horizon,
+            "rtc_overlap_steps": overlap_steps,
+            "rtc_frozen_steps": frozen_steps,
+            "rtc_ramp_rate": ramp_rate,
+        }
+
+    @torch.no_grad()
     def get_action_with_features(
         self,
         backbone_features: torch.Tensor,
@@ -343,42 +398,31 @@ class Gr00tN1d7ActionHead(nn.Module):
         vel_strength = torch.ones_like(actions)
 
         if "action" in action_input:
-            # If action in input when doing get action, it means we want to use RTC.
-            # action_horizon is the action horizon of the input action.
-            # rtc_overlap_steps is the number of steps to overlap with the previous action chunks.
-            # rtc_frozen_steps is the number of steps to freeze the action, which is the latency of the policy inference.
-            # rtc_ramp_rate is the rate of the ramp of denoising the actions.
-            assert options is not None, "options is not None"
-            assert "action_horizon" in options, "action_horizon is not in options"
-            assert "rtc_overlap_steps" in options, "rtc_overlap_steps is not in options"
-            assert "rtc_frozen_steps" in options, "rtc_frozen_steps is not in options"
-            assert "rtc_ramp_rate" in options, "rtc_ramp_rate is not in options"
-
-            action_horizon_before_padding = options["action_horizon"]
+            rtc = self._validate_rtc_options(action_input, options)
+            action_horizon_before_padding = int(rtc["action_horizon"])
+            overlap_steps = int(rtc["rtc_overlap_steps"])
+            frozen_steps = int(rtc["rtc_frozen_steps"])
+            ramp_rate = float(rtc["rtc_ramp_rate"])
 
             # Use previous action instead of pure noise to do inpainting
-            actions[:, : options["rtc_overlap_steps"], :] = action_input["action"][
+            actions[:, :overlap_steps, :] = action_input["action"][
                 :,
-                action_horizon_before_padding
-                - options["rtc_overlap_steps"] : action_horizon_before_padding,
+                action_horizon_before_padding - overlap_steps : action_horizon_before_padding,
                 :,
             ]
-            vel_strength[:, : options["rtc_frozen_steps"], :] = 0.0
+            vel_strength[:, :frozen_steps, :] = 0.0
             # NOTE: use an exponential ramp strength to set the remaining unfrozen rtc_steps
-            intermediate_steps = options["rtc_overlap_steps"] - options["rtc_frozen_steps"]
+            intermediate_steps = overlap_steps - frozen_steps
             # Create exponential ramp from 0 to 1 over intermediate steps
-            t = torch.linspace(0.0, 1.0, intermediate_steps + 2, device=device)
-            ramp = 1 - torch.exp(-options["rtc_ramp_rate"] * t)
-            ramp = ramp / ramp[-1].clamp_min(1e-8)  # normalize to [0,1]
-            ramp = ramp[
-                1:-1
-            ]  # we will only take the middle part of the ramp, ignore the 0.0 and 1.0
-            # Apply ramp to the intermediate steps [batch, intermediate_steps, action_dim]
-            vel_strength[
-                :,
-                options["rtc_frozen_steps"] : options["rtc_overlap_steps"],
-                :,
-            ] = ramp[None, :, None].to(device)
+            if intermediate_steps > 0:
+                t = torch.linspace(0.0, 1.0, intermediate_steps + 2, device=device)
+                ramp = 1 - torch.exp(-ramp_rate * t)
+                ramp = ramp / ramp[-1].clamp_min(1e-8)  # normalize to [0,1]
+                ramp = ramp[
+                    1:-1
+                ]  # we will only take the middle part of the ramp, ignore the 0.0 and 1.0
+                # Apply ramp to the intermediate steps [batch, intermediate_steps, action_dim]
+                vel_strength[:, frozen_steps:overlap_steps, :] = ramp[None, :, None].to(device)
 
         # Run denoising steps.
         for t in range(self.num_inference_timesteps):

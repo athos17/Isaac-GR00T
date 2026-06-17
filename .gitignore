@@ -3,7 +3,7 @@
 /ref_paper
 
 # Finetune datasets
-/examples
+/reference_paper
 
 # UV lock file
 uv.lock
@@ -168,4 +168,17 @@ offline_open_loop_eval_plots/
 /models
 /data
 
-examples/
+# Example code/configs are tracked; large example datasets and generated artifacts are ignored.
+examples/**/data/
+examples/**/videos/
+examples/**/meta/
+examples/**/.cache/
+examples/**/filtered_out/
+examples/**/client_log/
+examples/**/*.mp4
+examples/**/*.avi
+examples/**/*.mov
+examples/**/*.mkv
+examples/**/*.parquet
+examples/**/*.hdf5
+examples/**/*.h5
