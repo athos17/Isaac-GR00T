@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, replace
+from fractions import Fraction
 import json
 import math
 from pathlib import Path
@@ -939,6 +940,43 @@ def _write_video(
     return height, width, 3
 
 
+def _probe_video_timing(video_path: Path) -> tuple[int, float]:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-count_frames",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=nb_frames,nb_read_frames,avg_frame_rate",
+        "-of",
+        "json",
+        str(video_path),
+    ]
+    try:
+        output = subprocess.check_output(cmd, text=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffprobe executable not found; it is required for video validation") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"ffprobe failed while validating video '{video_path}'") from exc
+
+    try:
+        streams = json.loads(output)["streams"]
+        stream = streams[0]
+        frame_count_text = stream.get("nb_frames") or stream.get("nb_read_frames")
+        num_frames = int(frame_count_text)
+        fps = float(Fraction(stream["avg_frame_rate"]))
+    except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError) as exc:
+        raise RuntimeError(f"Could not parse ffprobe timing metadata for '{video_path}'") from exc
+
+    if num_frames <= 0:
+        raise RuntimeError(f"Video '{video_path}' has no decodable frames")
+    if fps <= 0:
+        raise RuntimeError(f"Video '{video_path}' has invalid average fps: {fps}")
+    return num_frames, fps
+
+
 def _estimate_fps(timestamps: np.ndarray, fallback: float = 30.0) -> float:
     if len(timestamps) < 2:
         return fallback
@@ -947,6 +985,48 @@ def _estimate_fps(timestamps: np.ndarray, fallback: float = 30.0) -> float:
     if len(deltas) == 0:
         return fallback
     return float(1.0 / np.median(deltas))
+
+
+def _clamp_timestamps_for_video_indexing(
+    timestamps: np.ndarray,
+    video_streams: list[tuple[int, float]],
+) -> np.ndarray:
+    """Clamp timestamps so round(timestamp * actual_video_fps) stays in range."""
+    if len(timestamps) == 0:
+        return timestamps
+
+    max_timestamp = math.inf
+    for num_frames, fps in video_streams:
+        if num_frames <= 0:
+            raise ValueError(f"Video stream has no frames: num_frames={num_frames}")
+        if fps <= 0:
+            raise ValueError(f"Video stream has invalid fps: fps={fps}")
+        stream_max = np.nextafter((num_frames - 0.5) / fps, 0.0)
+        max_timestamp = min(max_timestamp, stream_max)
+
+    clamped = np.minimum(timestamps.astype(np.float64), max_timestamp).astype(timestamps.dtype)
+    for _ in range(16):
+        invalid = np.zeros(len(clamped), dtype=bool)
+        for num_frames, fps in video_streams:
+            invalid |= np.rint(clamped.astype(np.float64) * fps) >= num_frames
+        if not invalid.any():
+            return clamped
+        clamped[invalid] = np.nextafter(clamped[invalid], np.array(0, dtype=clamped.dtype))
+    raise RuntimeError("Could not clamp timestamps into the valid video frame range")
+
+
+def _rewrite_parquet_timestamps_if_needed(
+    parquet_path: Path,
+    video_streams: list[tuple[int, float]],
+) -> bool:
+    df = pd.read_parquet(parquet_path)
+    original = df["timestamp"].to_numpy()
+    clamped = _clamp_timestamps_for_video_indexing(original, video_streams)
+    if np.array_equal(original, clamped):
+        return False
+    df["timestamp"] = clamped
+    df.to_parquet(parquet_path, index=False)
+    return True
 
 
 def _rows_to_dataframe(
@@ -1200,6 +1280,7 @@ def _write_episode_outputs(task: EpisodeConversionTask) -> EpisodeConversionResu
     parquet_path = data_dir / f"episode_{task.episode_index:06d}.parquet"
     df.to_parquet(parquet_path, index=False)
 
+    video_streams = []
     for topic_key, modality_key in VIDEO_MODALITY_KEYS.items():
         video_path = (
             video_base_dir
@@ -1213,6 +1294,9 @@ def _write_episode_outputs(task: EpisodeConversionTask) -> EpisodeConversionResu
             task.image_size,
         )
         episode.video_shapes[topic_key] = written_shape
+        video_streams.append(_probe_video_timing(video_path))
+
+    _rewrite_parquet_timestamps_if_needed(parquet_path, video_streams)
 
     # Generate quality metrics if enabled
     quality_metrics = None
