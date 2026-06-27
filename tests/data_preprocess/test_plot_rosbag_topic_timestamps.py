@@ -63,7 +63,16 @@ def test_load_topic_timestamps_returns_relative_seconds(tmp_path):
 
 def test_default_topic_map_contains_wuji_alignment_topics():
     assert DEFAULT_TOPIC_MAP["right_eef_action"] == "/astribot_arm_right/endpoint_desired_states"
-    assert DEFAULT_TOPIC_MAP["left_wrist_rgb"].endswith("/left_wrist_rgbd/color_compress/compressed")
+    assert DEFAULT_TOPIC_MAP["left_arm_joint_state"] == "/astribot_arm_left/joint_space_states"
+    assert (
+        DEFAULT_TOPIC_MAP["right_arm_joint_action"]
+        == "/astribot_arm_right/joint_space_command_recv"
+    )
+    assert DEFAULT_TOPIC_MAP["left_hand_state"] == "/left_hand/joint_states"
+    assert DEFAULT_TOPIC_MAP["right_hand_action"] == "/right_hand/joint_commands"
+    assert DEFAULT_TOPIC_MAP["left_wrist_rgb"].endswith(
+        "/left_wrist_rgbd/color_compress/compressed"
+    )
 
 
 def test_plot_topic_timestamps_accepts_tick_marker_style(tmp_path):

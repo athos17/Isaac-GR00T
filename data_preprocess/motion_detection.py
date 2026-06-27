@@ -92,6 +92,8 @@ def detect_motion_window(
     action: np.ndarray,
     config: MotionDetectionConfig,
     eef_dim: int = 9,  # For rot6d: xyz (3) + rot6d (6)
+    state_layout: str = "eef",
+    joint_arm_dims: tuple[int, int] | None = None,
 ) -> MotionDetectionResult:
     """Detect the window of meaningful motion in an episode.
 
@@ -101,6 +103,8 @@ def detect_motion_window(
         action: Shape (T, action_dim) action trajectory (same layout as state)
         config: Motion detection configuration
         eef_dim: Dimension of each EEF state (9 for rot6d, 6 for rotvec)
+        state_layout: `eef` for [left_eef, right_eef, hands] or `joint` for joint_space
+        joint_arm_dims: Optional left/right arm dimensions for joint layout with trailing hands.
 
     Returns:
         MotionDetectionResult with detected motion window and statistics
@@ -108,22 +112,40 @@ def detect_motion_window(
     T = len(state)
     window_frames = int(config.window_duration_sec * config.fps)
 
-    # Extract left and right EEF xyz (first 3 dimensions of each EEF)
-    left_eef_xyz = state[:, :3]  # (T, 3)
-    right_eef_xyz = state[:, eef_dim : eef_dim + 3]  # (T, 3)
+    if state_layout == "eef":
+        # Extract left and right EEF xyz (first 3 dimensions of each EEF)
+        left_eef_xyz = state[:, :3]  # (T, 3)
+        right_eef_xyz = state[:, eef_dim : eef_dim + 3]  # (T, 3)
 
-    # Compute EEF velocities
-    left_vel = _compute_eef_velocity(left_eef_xyz, config.fps)  # (T-1,)
-    right_vel = _compute_eef_velocity(right_eef_xyz, config.fps)  # (T-1,)
-    combined_eef_vel = left_vel + right_vel  # (T-1,)
+        # Compute EEF velocities
+        left_vel = _compute_eef_velocity(left_eef_xyz, config.fps)  # (T-1,)
+        right_vel = _compute_eef_velocity(right_eef_xyz, config.fps)  # (T-1,)
+        combined_eef_vel = left_vel + right_vel  # (T-1,)
 
-    # Extract hand joints (everything after the two EEFs)
-    hand_start_idx = 2 * eef_dim
-    left_hand_joints = state[:, hand_start_idx:]  # Includes both hands
-    hand_vel = _compute_hand_velocity(left_hand_joints, config.fps)  # (T-1,)
+        # Extract hand joints (everything after the two EEFs)
+        hand_start_idx = 2 * eef_dim
+        joint_state = state[:, hand_start_idx:]  # Includes both hands
+    elif state_layout == "joint":
+        if joint_arm_dims is None:
+            arm_state = state
+            joint_state = state
+        else:
+            arm_dim = sum(joint_arm_dims)
+            arm_state = state[:, :arm_dim]
+            joint_state = state[:, arm_dim:]
+            if joint_state.shape[1] == 0:
+                joint_state = arm_state
+        combined_eef_vel = _compute_hand_velocity(arm_state, config.fps)
+    else:
+        raise ValueError(f"Unsupported state_layout: {state_layout}")
 
-    # Compute action-state difference
-    action_state_diff = np.linalg.norm(action - state, axis=1)  # (T,)
+    hand_vel = _compute_hand_velocity(joint_state, config.fps)  # (T-1,)
+
+    # Compute action-state difference only when action and state share a layout.
+    if action.shape == state.shape:
+        action_state_diff = np.linalg.norm(action - state, axis=1)  # (T,)
+    else:
+        action_state_diff = np.zeros(T, dtype=np.float32)
     action_state_diff_vel = action_state_diff[:-1]  # Align with velocity (T-1,)
 
     # Combine all motion signals

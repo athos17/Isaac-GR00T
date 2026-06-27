@@ -30,6 +30,7 @@ MOTION_DETECTION_AVAILABLE = False
 # Add current directory and parent directory to path for imports
 import sys
 from pathlib import Path as _ImportPath
+
 _script_dir = _ImportPath(__file__).parent
 _project_root = _script_dir.parent
 if str(_project_root) not in sys.path:
@@ -51,6 +52,7 @@ try:
         create_episode_quality_metrics,
         write_quality_report,
     )
+
     MOTION_DETECTION_AVAILABLE = True
 except ImportError:
     try:
@@ -67,6 +69,7 @@ except ImportError:
             create_episode_quality_metrics,
             write_quality_report,
         )
+
         MOTION_DETECTION_AVAILABLE = True
     except ImportError:
         try:
@@ -83,6 +86,7 @@ except ImportError:
                 create_episode_quality_metrics,
                 write_quality_report,
             )
+
             MOTION_DETECTION_AVAILABLE = True
         except ImportError:
             pass
@@ -93,6 +97,10 @@ DEFAULT_TOPICS = {
     "right_eef_state": "/astribot_arm_right/endpoint_current_states",
     "left_eef_action": "/astribot_arm_left/endpoint_desired_states",
     "right_eef_action": "/astribot_arm_right/endpoint_desired_states",
+    "left_joint_space_state": "/astribot_arm_left/joint_space_states",
+    "right_joint_space_state": "/astribot_arm_right/joint_space_states",
+    "left_joint_space_action": "/astribot_arm_left/joint_space_command_recv",
+    "right_joint_space_action": "/astribot_arm_right/joint_space_command_recv",
     "left_hand_state": "/left_hand/joint_states",
     "right_hand_state": "/right_hand/joint_states",
     "left_hand_action": "/left_hand/joint_commands",
@@ -110,6 +118,14 @@ VIDEO_MODALITY_KEYS = {
 }
 
 STATE_KEYS = ["left_eef", "right_eef", "left_hand_joints", "right_hand_joints"]
+EEF_ACTION_KEYS = STATE_KEYS
+JOINT_SPACE_KEYS = ["left_joint_space", "right_joint_space"]
+JOINT_SPACE_WITH_HAND_KEYS = [
+    "left_joint_space",
+    "right_joint_space",
+    "left_hand_joints",
+    "right_hand_joints",
+]
 DEFAULT_LOW_PASS_FILTER_STREAMS = (
     "left_eef_action",
     "right_eef_action",
@@ -121,12 +137,17 @@ FILTERABLE_STREAM_KEYS = (
     "right_eef_state",
     "left_eef_action",
     "right_eef_action",
+    "left_joint_space_state",
+    "right_joint_space_state",
+    "left_joint_space_action",
+    "right_joint_space_action",
     "left_hand_state",
     "right_hand_state",
     "left_hand_action",
     "right_hand_action",
 )
 TimestampSource = Literal["header", "rosbag"]
+ActionSpace = Literal["eef", "joint"]
 
 CUSTOM_MSG_DEFINITIONS = {
     "astribot_msgs/msg/RobotCartesianState": """\
@@ -138,6 +159,15 @@ geometry_msgs/Wrench wrench
     "astribot_msgs/msg/RobotCartesianStates": """\
 std_msgs/Header header
 astribot_msgs/RobotCartesianState[] states
+""",
+    "astribot_msgs/msg/RobotJointState": """\
+std_msgs/Header header
+int8 mode
+string[] name
+float64[] position
+float64[] velocity
+float64[] acceleration
+float64[] torque
 """,
 }
 
@@ -183,6 +213,7 @@ class EpisodeConversionTask:
     image_size: tuple[int, int] | None
     chunks_size: int
     global_start_index: int
+    action_space: ActionSpace = "eef"
     low_pass_filter_config: LowPassFilterConfig | None = None
     motion_detection_config: Any | None = None  # MotionDetectionConfig if enabled
 
@@ -491,14 +522,32 @@ def _eef_sample(msg: Any, rotation_format: str) -> np.ndarray:
 
 
 def _joint_sample(msg: Any) -> np.ndarray:
-    positions = np.asarray(getattr(msg, "position", []), dtype=np.float32)
+    positions = _joint_positions(msg)
     if positions.size == 0:
         raise ValueError("JointState has no position values")
     return positions.astype(np.float32)
 
 
+def _joint_positions(msg: Any) -> np.ndarray:
+    for field in (
+        "position",
+        "positions",
+        "joint_position",
+        "joint_positions",
+        "q",
+        "qpos",
+        "pos",
+    ):
+        if hasattr(msg, field):
+            return np.asarray(getattr(msg, field), dtype=np.float32)
+    nested = getattr(msg, "joint_state", None)
+    if nested is not None:
+        return _joint_positions(nested)
+    return np.asarray([], dtype=np.float32)
+
+
 def _joint_feature_names(msg: Any, prefix: str) -> list[str]:
-    positions = np.asarray(getattr(msg, "position", []), dtype=np.float32)
+    positions = _joint_positions(msg)
     names = [str(name) for name in getattr(msg, "name", [])]
     if len(names) == len(positions):
         return [f"{prefix}.{name}" for name in names]
@@ -634,9 +683,47 @@ def _build_streams(
     work_dir: Path | None,
     bag_backend: str,
     timestamp_source: TimestampSource,
+    action_space: ActionSpace = "eef",
     low_pass_filter_config: LowPassFilterConfig | None = None,
+    include_eef_for_motion_detection: bool = False,
 ) -> tuple[dict[str, list[TimedSample]], dict[str, list[str]]]:
-    required_topics = set(topics.values())
+    if action_space == "eef":
+        stream_topic_keys = [
+            "left_eef_state",
+            "right_eef_state",
+            "left_eef_action",
+            "right_eef_action",
+            "left_hand_state",
+            "right_hand_state",
+            "left_hand_action",
+            "right_hand_action",
+            *VIDEO_TOPIC_KEYS,
+        ]
+    elif action_space == "joint":
+        stream_topic_keys = [
+            "left_joint_space_state",
+            "right_joint_space_state",
+            "left_joint_space_action",
+            "right_joint_space_action",
+            "left_hand_state",
+            "right_hand_state",
+            "left_hand_action",
+            "right_hand_action",
+            *VIDEO_TOPIC_KEYS,
+        ]
+        if include_eef_for_motion_detection:
+            stream_topic_keys.extend(
+                [
+                    "left_eef_state",
+                    "right_eef_state",
+                    "left_eef_action",
+                    "right_eef_action",
+                ]
+            )
+    else:
+        raise ValueError(f"Unsupported action space: {action_space}")
+
+    required_topics = {topics[key] for key in stream_topic_keys}
     raw = _read_bag_messages(
         bag_dir,
         required_topics,
@@ -644,53 +731,11 @@ def _build_streams(
         bag_backend,
         timestamp_source,
     )
-    empty_raw = [key for key, topic in topics.items() if not raw[topic]]
+    empty_raw = [key for key in stream_topic_keys if not raw[topics[key]]]
     if empty_raw:
         raise ValueError(f"{bag_dir} has no readable raw messages for streams: {empty_raw}")
 
-    hand_feature_names = {
-        "left_hand_joints": _joint_feature_names(
-            raw[topics["left_hand_state"]][0][1],
-            "left_hand_joints",
-        ),
-        "right_hand_joints": _joint_feature_names(
-            raw[topics["right_hand_state"]][0][1],
-            "right_hand_joints",
-        ),
-    }
     streams = {
-        "left_eef_state": _to_timed_samples(
-            raw[topics["left_eef_state"]],
-            lambda msg: _eef_sample(msg, rotation_format),
-        ),
-        "right_eef_state": _to_timed_samples(
-            raw[topics["right_eef_state"]],
-            lambda msg: _eef_sample(msg, rotation_format),
-        ),
-        "left_eef_action": _to_timed_samples(
-            raw[topics["left_eef_action"]],
-            lambda msg: _eef_sample(msg, rotation_format),
-        ),
-        "right_eef_action": _to_timed_samples(
-            raw[topics["right_eef_action"]],
-            lambda msg: _eef_sample(msg, rotation_format),
-        ),
-        "left_hand_state": _to_timed_samples(
-            raw[topics["left_hand_state"]],
-            _joint_sample,
-        ),
-        "right_hand_state": _to_timed_samples(
-            raw[topics["right_hand_state"]],
-            _joint_sample,
-        ),
-        "left_hand_action": _to_timed_samples(
-            raw[topics["left_hand_action"]],
-            _joint_sample,
-        ),
-        "right_hand_action": _to_timed_samples(
-            raw[topics["right_hand_action"]],
-            _joint_sample,
-        ),
         "head_rgb": _to_timed_samples(
             raw[topics["head_rgb"]],
             _decode_image_sample,
@@ -704,6 +749,178 @@ def _build_streams(
             _decode_image_sample,
         ),
     }
+
+    if action_space == "joint":
+        joint_feature_names = {
+            "left_joint_space": _joint_feature_names(
+                raw[topics["left_joint_space_state"]][0][1],
+                "left_joint_space",
+            ),
+            "right_joint_space": _joint_feature_names(
+                raw[topics["right_joint_space_state"]][0][1],
+                "right_joint_space",
+            ),
+            "left_hand_joints": _joint_feature_names(
+                raw[topics["left_hand_state"]][0][1],
+                "left_hand_joints",
+            ),
+            "right_hand_joints": _joint_feature_names(
+                raw[topics["right_hand_state"]][0][1],
+                "right_hand_joints",
+            ),
+        }
+        streams["left_joint_space_state"] = _to_timed_samples(
+            raw[topics["left_joint_space_state"]],
+            _joint_sample,
+        )
+        streams["right_joint_space_state"] = _to_timed_samples(
+            raw[topics["right_joint_space_state"]],
+            _joint_sample,
+        )
+        streams["left_joint_space_action"] = _to_timed_samples(
+            raw[topics["left_joint_space_action"]],
+            _joint_sample,
+        )
+        streams["right_joint_space_action"] = _to_timed_samples(
+            raw[topics["right_joint_space_action"]],
+            _joint_sample,
+        )
+        streams["left_hand_state"] = _to_timed_samples(
+            raw[topics["left_hand_state"]],
+            _joint_sample,
+        )
+        streams["right_hand_state"] = _to_timed_samples(
+            raw[topics["right_hand_state"]],
+            _joint_sample,
+        )
+        streams["left_hand_action"] = _to_timed_samples(
+            raw[topics["left_hand_action"]],
+            _joint_sample,
+        )
+        streams["right_hand_action"] = _to_timed_samples(
+            raw[topics["right_hand_action"]],
+            _joint_sample,
+        )
+        if include_eef_for_motion_detection:
+            streams["left_eef_state"] = _to_timed_samples(
+                raw[topics["left_eef_state"]],
+                lambda msg: _eef_sample(msg, rotation_format),
+            )
+            streams["right_eef_state"] = _to_timed_samples(
+                raw[topics["right_eef_state"]],
+                lambda msg: _eef_sample(msg, rotation_format),
+            )
+            streams["left_eef_action"] = _to_timed_samples(
+                raw[topics["left_eef_action"]],
+                lambda msg: _eef_sample(msg, rotation_format),
+            )
+            streams["right_eef_action"] = _to_timed_samples(
+                raw[topics["right_eef_action"]],
+                lambda msg: _eef_sample(msg, rotation_format),
+            )
+
+        streams = _apply_low_pass_filter(streams, low_pass_filter_config)
+        empty = [name for name, samples in streams.items() if not samples]
+        if empty:
+            raise ValueError(f"{bag_dir} has no readable samples for streams: {empty}")
+
+        joint_dim_pairs = {
+            "left_joint_space": (
+                len(streams["left_joint_space_state"][0].value),
+                len(streams["left_joint_space_action"][0].value),
+            ),
+            "right_joint_space": (
+                len(streams["right_joint_space_state"][0].value),
+                len(streams["right_joint_space_action"][0].value),
+            ),
+        }
+        mismatched = {
+            key: {"state": state_dim, "action": action_dim}
+            for key, (state_dim, action_dim) in joint_dim_pairs.items()
+            if state_dim != action_dim
+        }
+        if mismatched:
+            raise ValueError(f"Joint-space state/action dimensions must match: {mismatched}")
+        hand_dim_pairs = {
+            "left_hand_joints": (
+                len(streams["left_hand_state"][0].value),
+                len(streams["left_hand_action"][0].value),
+            ),
+            "right_hand_joints": (
+                len(streams["right_hand_state"][0].value),
+                len(streams["right_hand_action"][0].value),
+            ),
+        }
+        mismatched_hands = {
+            key: {"state": state_dim, "action": action_dim}
+            for key, (state_dim, action_dim) in hand_dim_pairs.items()
+            if state_dim != action_dim
+        }
+        if mismatched_hands:
+            raise ValueError(f"Hand state/action dimensions must match for metadata: {mismatched_hands}")
+        for key in JOINT_SPACE_KEYS:
+            names_dim = len(joint_feature_names[key])
+            state_dim = joint_dim_pairs[key][0]
+            if names_dim != state_dim:
+                raise ValueError(
+                    f"{key} metadata names length {names_dim} does not match dim {state_dim}"
+                )
+        for key in ["left_hand_joints", "right_hand_joints"]:
+            names_dim = len(joint_feature_names[key])
+            state_dim = hand_dim_pairs[key][0]
+            if names_dim != state_dim:
+                raise ValueError(
+                    f"{key} metadata names length {names_dim} does not match dim {state_dim}"
+                )
+        return streams, joint_feature_names
+
+    joint_feature_names = {
+        "left_hand_joints": _joint_feature_names(
+            raw[topics["left_hand_state"]][0][1],
+            "left_hand_joints",
+        ),
+        "right_hand_joints": _joint_feature_names(
+            raw[topics["right_hand_state"]][0][1],
+            "right_hand_joints",
+        ),
+    }
+    streams.update(
+        {
+            "left_eef_state": _to_timed_samples(
+                raw[topics["left_eef_state"]],
+                lambda msg: _eef_sample(msg, rotation_format),
+            ),
+            "right_eef_state": _to_timed_samples(
+                raw[topics["right_eef_state"]],
+                lambda msg: _eef_sample(msg, rotation_format),
+            ),
+            "left_hand_state": _to_timed_samples(
+                raw[topics["left_hand_state"]],
+                _joint_sample,
+            ),
+            "right_hand_state": _to_timed_samples(
+                raw[topics["right_hand_state"]],
+                _joint_sample,
+            ),
+            "left_hand_action": _to_timed_samples(
+                raw[topics["left_hand_action"]],
+                _joint_sample,
+            ),
+            "right_hand_action": _to_timed_samples(
+                raw[topics["right_hand_action"]],
+                _joint_sample,
+            ),
+        }
+    )
+    streams["left_eef_action"] = _to_timed_samples(
+        raw[topics["left_eef_action"]],
+        lambda msg: _eef_sample(msg, rotation_format),
+    )
+    streams["right_eef_action"] = _to_timed_samples(
+        raw[topics["right_eef_action"]],
+        lambda msg: _eef_sample(msg, rotation_format),
+    )
+
     streams = _apply_low_pass_filter(streams, low_pass_filter_config)
     empty = [name for name, samples in streams.items() if not samples]
     if empty:
@@ -725,13 +942,14 @@ def _build_streams(
     }
     if mismatched:
         raise ValueError(f"Hand state/action dimensions must match for metadata: {mismatched}")
-    for key, names in hand_feature_names.items():
+    for key in ["left_hand_joints", "right_hand_joints"]:
+        names = joint_feature_names[key]
         state_dim = hand_dim_pairs[key][0]
         if len(names) != state_dim:
             raise ValueError(
                 f"{key} metadata names length {len(names)} does not match dim {state_dim}"
             )
-    return streams, hand_feature_names
+    return streams, joint_feature_names
 
 
 def _align_episode(
@@ -742,6 +960,7 @@ def _align_episode(
     work_dir: Path | None,
     bag_backend: str,
     timestamp_source: TimestampSource,
+    action_space: ActionSpace = "eef",
     low_pass_filter_config: LowPassFilterConfig | None = None,
     motion_detection_config: Any | None = None,
 ) -> AlignedEpisode:
@@ -752,7 +971,9 @@ def _align_episode(
         work_dir=work_dir,
         bag_backend=bag_backend,
         timestamp_source=timestamp_source,
+        action_space=action_space,
         low_pass_filter_config=low_pass_filter_config,
+        include_eef_for_motion_detection=motion_detection_config is not None,
     )
 
     common_start, common_end = _common_time_window(streams)
@@ -773,6 +994,8 @@ def _align_episode(
     cursors = {name: 0 for name in streams}
     states = []
     actions = []
+    motion_states = []
+    motion_actions = []
     videos = {key: [] for key in VIDEO_TOPIC_KEYS}
     kept_timestamps = []
     max_seen_skew = 0.0
@@ -790,8 +1013,8 @@ def _align_episode(
         frame_max_skew = max(skews)
         max_seen_skew = max(max_seen_skew, frame_max_skew)
 
-        states.append(
-            np.concatenate(
+        if action_space == "eef":
+            state = np.concatenate(
                 [
                     selected["left_eef_state"],
                     selected["right_eef_state"],
@@ -799,9 +1022,7 @@ def _align_episode(
                     selected["right_hand_state"],
                 ]
             )
-        )
-        actions.append(
-            np.concatenate(
+            action = np.concatenate(
                 [
                     selected["left_eef_action"],
                     selected["right_eef_action"],
@@ -809,7 +1030,54 @@ def _align_episode(
                     selected["right_hand_action"],
                 ]
             )
-        )
+            states.append(state)
+            actions.append(action)
+            motion_states.append(state)
+            motion_actions.append(action)
+        elif action_space == "joint":
+            states.append(
+                np.concatenate(
+                    [
+                        selected["left_joint_space_state"],
+                        selected["right_joint_space_state"],
+                        selected["left_hand_state"],
+                        selected["right_hand_state"],
+                    ]
+                )
+            )
+            actions.append(
+                np.concatenate(
+                    [
+                        selected["left_joint_space_action"],
+                        selected["right_joint_space_action"],
+                        selected["left_hand_action"],
+                        selected["right_hand_action"],
+                    ]
+                )
+            )
+            if motion_detection_config is not None:
+                motion_states.append(
+                    np.concatenate(
+                        [
+                            selected["left_eef_state"],
+                            selected["right_eef_state"],
+                            selected["left_hand_state"],
+                            selected["right_hand_state"],
+                        ]
+                    )
+                )
+                motion_actions.append(
+                    np.concatenate(
+                        [
+                            selected["left_eef_action"],
+                            selected["right_eef_action"],
+                            selected["left_hand_action"],
+                            selected["right_hand_action"],
+                        ]
+                    )
+                )
+        else:
+            raise ValueError(f"Unsupported action space: {action_space}")
         for key in VIDEO_TOPIC_KEYS:
             videos[key].append(selected[key])
         kept_timestamps.append(float(timestamp - start))
@@ -819,6 +1087,12 @@ def _align_episode(
 
     state_array = np.stack(states).astype(np.float32)
     action_array = np.stack(actions).astype(np.float32)
+    motion_state_array = (
+        np.stack(motion_states).astype(np.float32) if motion_detection_config is not None else None
+    )
+    motion_action_array = (
+        np.stack(motion_actions).astype(np.float32) if motion_detection_config is not None else None
+    )
     timestamps_array = np.asarray(kept_timestamps, dtype=np.float32)
 
     # Apply motion detection if enabled
@@ -826,7 +1100,11 @@ def _align_episode(
     if motion_detection_config is not None and MOTION_DETECTION_AVAILABLE:
         eef_dim = 9 if rotation_format == "rot6d" else 6
         motion_result = detect_motion_window(
-            state_array, action_array, motion_detection_config, eef_dim=eef_dim
+            motion_state_array,
+            motion_action_array,
+            motion_detection_config,
+            eef_dim=eef_dim,
+            state_layout="eef",
         )
         # Trim episode to motion window
         state_array, action_array, videos, timestamps_array = trim_episode_to_motion(
@@ -957,7 +1235,9 @@ def _probe_video_timing(video_path: Path) -> tuple[int, float]:
     try:
         output = subprocess.check_output(cmd, text=True)
     except FileNotFoundError as exc:
-        raise RuntimeError("ffprobe executable not found; it is required for video validation") from exc
+        raise RuntimeError(
+            "ffprobe executable not found; it is required for video validation"
+        ) from exc
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(f"ffprobe failed while validating video '{video_path}'") from exc
 
@@ -1059,9 +1339,8 @@ def _modality_ranges(keys: list[str], dims: list[int]) -> dict[str, dict[str, in
     return ranges
 
 
-def _feature_names(
+def _state_feature_names(
     rotation_format: str,
-    hand_feature_names: dict[str, list[str]],
 ) -> tuple[list[str], list[int]]:
     if rotation_format == "rotvec":
         eef_suffixes = ["x", "y", "z", "rotvec_x", "rotvec_y", "rotvec_z"]
@@ -1085,11 +1364,64 @@ def _feature_names(
     names = []
     for prefix in ["left_eef", "right_eef"]:
         names.extend([f"{prefix}.{suffix}" for suffix in eef_suffixes])
-    left_hand_names = hand_feature_names["left_hand_joints"]
-    right_hand_names = hand_feature_names["right_hand_joints"]
-    names.extend(left_hand_names)
-    names.extend(right_hand_names)
-    return names, [eef_dim, eef_dim, len(left_hand_names), len(right_hand_names)]
+    return names, [eef_dim, eef_dim]
+
+
+def _metadata_feature_names(
+    rotation_format: str,
+    action_space: ActionSpace,
+    feature_names: dict[str, list[str]],
+) -> tuple[list[str], list[int], list[str], list[int]]:
+    if action_space == "joint":
+        left_joint_space_names = feature_names["left_joint_space"]
+        right_joint_space_names = feature_names["right_joint_space"]
+        left_hand_names = feature_names["left_hand_joints"]
+        right_hand_names = feature_names["right_hand_joints"]
+        joint_space_names = (
+            list(left_joint_space_names)
+            + list(right_joint_space_names)
+            + list(left_hand_names)
+            + list(right_hand_names)
+        )
+        joint_space_dims = [
+            len(left_joint_space_names),
+            len(right_joint_space_names),
+            len(left_hand_names),
+            len(right_hand_names),
+        ]
+        return (
+            list(joint_space_names),
+            list(joint_space_dims),
+            list(joint_space_names),
+            list(joint_space_dims),
+        )
+
+    state_names, state_dims = _state_feature_names(rotation_format)
+    left_hand_names = feature_names["left_hand_joints"]
+    right_hand_names = feature_names["right_hand_joints"]
+    state_names.extend(left_hand_names)
+    state_names.extend(right_hand_names)
+    state_dims.extend([len(left_hand_names), len(right_hand_names)])
+
+    if action_space == "eef":
+        action_names = list(state_names)
+        action_dims = list(state_dims)
+    else:
+        raise ValueError(f"Unsupported action space: {action_space}")
+
+    return state_names, state_dims, action_names, action_dims
+
+
+def _feature_names(
+    rotation_format: str,
+    hand_feature_names: dict[str, list[str]],
+) -> tuple[list[str], list[int]]:
+    state_names, state_dims, _, _ = _metadata_feature_names(
+        rotation_format,
+        "eef",
+        hand_feature_names,
+    )
+    return state_names, state_dims
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -1106,8 +1438,9 @@ def _write_metadata(
     fps: float,
     chunks_size: int,
     rotation_format: str,
+    action_space: ActionSpace,
     video_shapes: dict[str, tuple[int, int, int]],
-    hand_feature_names: dict[str, list[str]],
+    feature_names: dict[str, list[str]],
 ) -> None:
     meta_dir = output_dir / "meta"
     meta_dir.mkdir(parents=True, exist_ok=True)
@@ -1115,15 +1448,22 @@ def _write_metadata(
     _write_jsonl(meta_dir / "episodes.jsonl", episodes)
     _write_jsonl(meta_dir / "tasks.jsonl", tasks)
 
-    names, dims = _feature_names(rotation_format, hand_feature_names)
-    state_dim = sum(dims)
+    state_names, state_dims, action_names, action_dims = _metadata_feature_names(
+        rotation_format,
+        action_space,
+        feature_names,
+    )
+    state_dim = sum(state_dims)
+    action_dim = sum(action_dims)
     video_modality = {
         modality_key: {"original_key": f"observation.images.{modality_key}"}
         for modality_key in VIDEO_MODALITY_KEYS.values()
     }
+    state_keys = STATE_KEYS if action_space == "eef" else JOINT_SPACE_WITH_HAND_KEYS
+    action_keys = EEF_ACTION_KEYS if action_space == "eef" else JOINT_SPACE_WITH_HAND_KEYS
     modality = {
-        "state": _modality_ranges(STATE_KEYS, dims),
-        "action": _modality_ranges(STATE_KEYS, dims),
+        "state": _modality_ranges(state_keys, state_dims),
+        "action": _modality_ranges(action_keys, action_dims),
         "video": video_modality,
         "annotation": {
             "human.action.task_description": {
@@ -1152,12 +1492,12 @@ def _write_metadata(
             "observation.state": {
                 "dtype": "float32",
                 "shape": [state_dim],
-                "names": names,
+                "names": state_names,
             },
             "action": {
                 "dtype": "float32",
-                "shape": [state_dim],
-                "names": names,
+                "shape": [action_dim],
+                "names": action_names,
             },
             "timestamp": {"dtype": "float32", "shape": [1], "names": None},
             "frame_index": {"dtype": "int64", "shape": [1], "names": None},
@@ -1170,7 +1510,7 @@ def _write_metadata(
                 "names": None,
             },
         },
-        "robot_type": f"WUJI_ASTRIBOT_EEF_HAND_{rotation_format.upper()}",
+        "robot_type": f"WUJI_ASTRIBOT_{action_space.upper()}_ACTION_{rotation_format.upper()}",
     }
     for topic_key, modality_key in VIDEO_MODALITY_KEYS.items():
         height, width, channels = video_shapes[topic_key]
@@ -1210,11 +1550,56 @@ def _parse_topic_overrides(values: list[str] | None) -> dict[str, str]:
     return topics
 
 
-def _validate_metadata_topics(bag_dir: Path, topics: dict[str, str]) -> None:
+def _required_topic_keys(
+    action_space: ActionSpace, include_eef_for_motion_detection: bool = False
+) -> list[str]:
+    if action_space == "eef":
+        return [
+            "left_eef_state",
+            "right_eef_state",
+            "left_eef_action",
+            "right_eef_action",
+            "left_hand_state",
+            "right_hand_state",
+            "left_hand_action",
+            "right_hand_action",
+            *VIDEO_TOPIC_KEYS,
+        ]
+    if action_space == "joint":
+        topic_keys = [
+            "left_joint_space_state",
+            "right_joint_space_state",
+            "left_joint_space_action",
+            "right_joint_space_action",
+            "left_hand_state",
+            "right_hand_state",
+            "left_hand_action",
+            "right_hand_action",
+            *VIDEO_TOPIC_KEYS,
+        ]
+        if include_eef_for_motion_detection:
+            topic_keys.extend(
+                [
+                    "left_eef_state",
+                    "right_eef_state",
+                    "left_eef_action",
+                    "right_eef_action",
+                ]
+            )
+        return topic_keys
+    raise ValueError(f"Unsupported action space: {action_space}")
+
+
+def _validate_metadata_topics(
+    bag_dir: Path,
+    topics: dict[str, str],
+    required_keys: list[str] | None = None,
+) -> None:
     metadata = _load_metadata(bag_dir)
     counts = _topic_counts(metadata)
-    missing = [topic for topic in topics.values() if topic not in counts]
-    empty = [topic for topic in topics.values() if counts.get(topic, 0) == 0]
+    required_topics = [topics[key] for key in (required_keys or list(topics))]
+    missing = [topic for topic in required_topics if topic not in counts]
+    empty = [topic for topic in required_topics if counts.get(topic, 0) == 0]
     if missing:
         raise ValueError(f"{bag_dir} metadata is missing required topics: {missing}")
     if empty:
@@ -1262,6 +1647,7 @@ def _write_episode_outputs(task: EpisodeConversionTask) -> EpisodeConversionResu
         work_dir=task.work_dir,
         bag_backend=task.bag_backend,
         timestamp_source=task.timestamp_source,
+        action_space=task.action_space,
         low_pass_filter_config=task.low_pass_filter_config,
         motion_detection_config=task.motion_detection_config,
     )
@@ -1365,6 +1751,7 @@ def _episode_metadata(
     timestamp_source: TimestampSource,
     max_time_skew: float,
     topics: dict[str, str],
+    action_space: ActionSpace,
     low_pass_filter_config: LowPassFilterConfig | None,
 ) -> dict[str, Any]:
     metadata = {
@@ -1375,6 +1762,7 @@ def _episode_metadata(
         "alignment": {
             "anchor": "head_rgb",
             "timestamp_source": timestamp_source,
+            "action_space": action_space,
             "output_fps": result.fps,
             "camera_frame_count": result.camera_frame_count,
             "max_time_skew_sec": result.max_skew,
@@ -1422,9 +1810,7 @@ def _move_episode_files(
     dest_video_dir = dest_root / "videos" / f"chunk-{episode_chunk:03d}"
     for modality_key in VIDEO_MODALITY_KEYS.values():
         video_file = (
-            video_base
-            / f"observation.images.{modality_key}"
-            / f"episode_{episode_index:06d}.mp4"
+            video_base / f"observation.images.{modality_key}" / f"episode_{episode_index:06d}.mp4"
         )
         if video_file.exists():
             dest_video_subdir = dest_video_dir / f"observation.images.{modality_key}"
@@ -1565,8 +1951,7 @@ def _filter_and_compact_episodes_by_quality(
 
     print(f"  ✓ Moved {len(filter_report)} failed episodes to {filtered_out_dir}")
     print(
-        f"  ✓ Compacted kept episodes to {len(kept_results)} episodes / "
-        f"{global_frame_index} frames"
+        f"  ✓ Compacted kept episodes to {len(kept_results)} episodes / {global_frame_index} frames"
     )
     print(f"  ✓ Wrote filter report to {filter_report_path}")
     print(f"\n  Failed episodes breakdown:")
@@ -1642,6 +2027,7 @@ def _make_episode_task(
         image_size=image_size,
         chunks_size=args.chunks_size,
         global_start_index=global_start_index,
+        action_space=args.action_space,
         low_pass_filter_config=low_pass_filter_config,
         motion_detection_config=motion_detection_config,
     )
@@ -1802,14 +2188,18 @@ def convert(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"No ROS2 bags found under {input_root}")
 
     topics = _parse_topic_overrides(args.topic)
+    required_topic_keys = _required_topic_keys(
+        args.action_space, include_eef_for_motion_detection=args.enable_motion_detection
+    )
     for bag_dir in bag_dirs:
-        _validate_metadata_topics(bag_dir, topics)
+        _validate_metadata_topics(bag_dir, topics, required_topic_keys)
 
     if args.dry_run:
         for bag_dir in bag_dirs:
             counts = _topic_counts(_load_metadata(bag_dir))
             print(bag_dir)
-            for key, topic in topics.items():
+            for key in required_topic_keys:
+                topic = topics[key]
                 print(f"  {key}: {topic} ({counts.get(topic, 0)} messages)")
         return
 
@@ -1847,8 +2237,10 @@ def convert(args: argparse.Namespace) -> None:
                 min_motion_frames=args.motion_min_frames,
                 fps=args.output_fps if args.output_fps else 30.0,
             )
-            print(f"Motion detection enabled: velocity_threshold={args.motion_velocity_threshold} m/s, "
-                  f"window={args.motion_window_sec}s")
+            print(
+                f"Motion detection enabled: velocity_threshold={args.motion_velocity_threshold} m/s, "
+                f"window={args.motion_window_sec}s"
+            )
 
     if args.num_workers == 1:
         (
@@ -1912,6 +2304,7 @@ def convert(args: argparse.Namespace) -> None:
             args.timestamp_source,
             args.max_time_skew,
             topics,
+            args.action_space,
             low_pass_filter_config,
         )
         for result in results
@@ -1926,9 +2319,12 @@ def convert(args: argparse.Namespace) -> None:
         fps=metadata_fps,
         chunks_size=args.chunks_size,
         rotation_format=args.eef_rotation_format,
+        action_space=args.action_space,
         video_shapes=video_shapes or {},
-        hand_feature_names=hand_feature_names
+        feature_names=hand_feature_names
         or {
+            "left_joint_space": [],
+            "right_joint_space": [],
             "left_hand_joints": [],
             "right_hand_joints": [],
         },
@@ -1972,7 +2368,9 @@ def convert(args: argparse.Namespace) -> None:
                     generate_rel_stats(output_dir, embodiment_tag)
                     print(f"    ✓ Wrote {output_dir / 'meta' / 'relative_stats.json'}")
                 except ValueError as e:
-                    print(f"    ⚠ Skipping relative_stats.json: invalid embodiment tag {args.embodiment_tag}")
+                    print(
+                        f"    ⚠ Skipping relative_stats.json: invalid embodiment tag {args.embodiment_tag}"
+                    )
                     print(f"      Error: {e}")
             else:
                 print("  - Skipping relative_stats.json (no --embodiment-tag provided)")
@@ -1980,7 +2378,9 @@ def convert(args: argparse.Namespace) -> None:
         except ImportError as e:
             print(f"  ⚠ Could not import stats generation modules: {e}")
             print("    Run stats generation manually in a different environment:")
-            print(f"    python gr00t/data/stats.py --dataset-path {output_dir} --embodiment-tag NEW_EMBODIMENT --modality-config-path {args.modality_config_path}")
+            print(
+                f"    python gr00t/data/stats.py --dataset-path {output_dir} --embodiment-tag NEW_EMBODIMENT --modality-config-path {args.modality_config_path}"
+            )
     else:
         print("\nSkipping automatic stats generation (use --generate-stats to enable)")
         print("To generate stats manually, run in your gr00t environment:")
@@ -2012,6 +2412,15 @@ def parse_args() -> argparse.Namespace:
         choices=["rotvec", "rot6d"],
         default="rotvec",
         help="EEF pose layout in observation.state/action.",
+    )
+    parser.add_argument(
+        "--action-space",
+        choices=["eef", "joint"],
+        default="eef",
+        help=(
+            "State/action representation. `eef` uses EEF state/action plus hand joints; "
+            "`joint` uses left/right joint-space state and command-recv topics."
+        ),
     )
     parser.add_argument(
         "--embodiment-tag",
