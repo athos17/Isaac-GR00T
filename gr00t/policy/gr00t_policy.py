@@ -212,80 +212,6 @@ class Gr00tPolicy(BasePolicy):
             embodiment=self.embodiment_tag,
         )
 
-    def _extract_rtc_request(
-        self, options: dict[str, Any] | None, batch_size: int
-    ) -> tuple[list[dict[str, np.ndarray]] | None, dict[str, Any] | None]:
-        if not options:
-            return None, None
-        rtc_options = options.get("rtc")
-        if not isinstance(rtc_options, dict) or not rtc_options.get("enabled", False):
-            return None, None
-
-        prev_chunk_left_over = rtc_options.get("prev_chunk_left_over")
-        if prev_chunk_left_over is None:
-            return None, None
-        if not isinstance(prev_chunk_left_over, dict):
-            raise ValueError("options['rtc']['prev_chunk_left_over'] must be a dict")
-
-        required_model_keys = (
-            "action_horizon",
-            "rtc_overlap_steps",
-            "rtc_frozen_steps",
-            "rtc_ramp_rate",
-        )
-        missing = [key for key in required_model_keys if key not in rtc_options]
-        if missing:
-            raise ValueError(f"options['rtc'] missing required keys: {missing}")
-
-        action_horizon = int(rtc_options["action_horizon"])
-        overlap_steps = int(rtc_options["rtc_overlap_steps"])
-        frozen_steps = int(rtc_options["rtc_frozen_steps"])
-        ramp_rate = float(rtc_options["rtc_ramp_rate"])
-        if action_horizon <= 0:
-            raise ValueError("action_horizon must be positive")
-        if overlap_steps < 0:
-            raise ValueError("rtc_overlap_steps must be non-negative")
-        if frozen_steps < 0:
-            raise ValueError("rtc_frozen_steps must be non-negative")
-        if overlap_steps > action_horizon:
-            raise ValueError("rtc_overlap_steps must be <= action_horizon")
-        if frozen_steps > overlap_steps:
-            raise ValueError("rtc_frozen_steps must be <= rtc_overlap_steps")
-        if ramp_rate <= 0.0:
-            raise ValueError("rtc_ramp_rate must be positive")
-
-        actions_by_sample: list[dict[str, np.ndarray]] = [dict() for _ in range(batch_size)]
-        for key, value in prev_chunk_left_over.items():
-            array = np.asarray(value, dtype=np.float32)
-            if array.ndim == 2:
-                if batch_size != 1:
-                    raise ValueError(
-                        f"RTC leftover action '{key}' is unbatched but observation batch size is {batch_size}"
-                    )
-                array = array[None, ...]
-            if array.ndim != 3:
-                raise ValueError(
-                    f"RTC leftover action '{key}' must have shape (B, T, D) or (T, D), got {array.shape}"
-                )
-            if array.shape[0] != batch_size:
-                raise ValueError(
-                    f"RTC leftover action '{key}' batch size {array.shape[0]} does not match observation batch size {batch_size}"
-                )
-            if array.shape[1] < overlap_steps:
-                raise ValueError(
-                    f"RTC leftover action '{key}' horizon {array.shape[1]} is shorter than rtc_overlap_steps={overlap_steps}"
-                )
-            for sample_index in range(batch_size):
-                actions_by_sample[sample_index][key] = array[sample_index]
-
-        model_options = {
-            "action_horizon": action_horizon,
-            "rtc_overlap_steps": overlap_steps,
-            "rtc_frozen_steps": frozen_steps,
-            "rtc_ramp_rate": ramp_rate,
-        }
-        return actions_by_sample, model_options
-
     def check_observation(self, observation: dict[str, Any]) -> None:
         """Validate that the observation has the correct structure and types.
 
@@ -468,19 +394,14 @@ class Gr00tPolicy(BasePolicy):
         Returns:
             Tuple of (actions_dict, info_dict)
         """
-        batch_size = next(iter(observation["video"].values())).shape[0]
-        rtc_actions_by_sample, model_options = self._extract_rtc_request(options, batch_size)
-
         # Step 1: Split batched observation into individual observations
         unbatched_observations = self._unbatch_observation(observation)
         processed_inputs = []
 
         # Step 2: Process each observation through the VLA processor
         states = []
-        for sample_index, obs in enumerate(unbatched_observations):
+        for obs in unbatched_observations:
             vla_step_data = self._to_vla_step_data(obs)
-            if rtc_actions_by_sample is not None:
-                vla_step_data.actions = rtc_actions_by_sample[sample_index]
             states.append(vla_step_data.states)  # dict[str, np.ndarray[np.float32, (T, D)]]
             messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
             processed_inputs.append(self.processor(messages))
@@ -491,10 +412,7 @@ class Gr00tPolicy(BasePolicy):
 
         # Step 4: Run model inference to predict actions
         with torch.inference_mode():
-            if model_options is None:
-                model_pred = self.model.get_action(**collated_inputs)
-            else:
-                model_pred = self.model.get_action(**collated_inputs, options=model_options)
+            model_pred = self.model.get_action(**collated_inputs)
         normalized_action = model_pred["action_pred"].float()
 
         # Step 5: Decode actions from normalized space back to physical units

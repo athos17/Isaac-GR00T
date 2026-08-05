@@ -150,62 +150,6 @@ class TestActionHeadGetAction:
         )
         assert out["action_pred"].shape[0] == 1
 
-    def test_get_action_accepts_valid_rtc_options(self, action_head):
-        head, config = action_head
-        action_input = _make_action_input(config, batch_size=1)
-        out = head.get_action(
-            _make_backbone_output(config, batch_size=1),
-            action_input,
-            options={
-                "action_horizon": config.action_horizon,
-                "rtc_overlap_steps": 2,
-                "rtc_frozen_steps": 1,
-                "rtc_ramp_rate": 2.5,
-            },
-        )
-        assert out["action_pred"].shape == (1, config.action_horizon, config.max_action_dim)
-
-    @pytest.mark.parametrize(
-        ("options", "match"),
-        [
-            (
-                {
-                    "action_horizon": 4,
-                    "rtc_overlap_steps": 5,
-                    "rtc_frozen_steps": 1,
-                    "rtc_ramp_rate": 2.5,
-                },
-                "rtc_overlap_steps",
-            ),
-            (
-                {
-                    "action_horizon": 4,
-                    "rtc_overlap_steps": 2,
-                    "rtc_frozen_steps": 3,
-                    "rtc_ramp_rate": 2.5,
-                },
-                "rtc_frozen_steps",
-            ),
-            (
-                {
-                    "action_horizon": 0,
-                    "rtc_overlap_steps": 0,
-                    "rtc_frozen_steps": 0,
-                    "rtc_ramp_rate": 2.5,
-                },
-                "action_horizon",
-            ),
-        ],
-    )
-    def test_get_action_validates_rtc_options(self, action_head, options, match):
-        head, config = action_head
-        with pytest.raises(ValueError, match=match):
-            head.get_action(
-                _make_backbone_output(config, batch_size=1),
-                _make_action_input(config, batch_size=1),
-                options=options,
-            )
-
 
 class TestActionHeadEncodeFeatures:
     """Test feature encoding helper."""
