@@ -20,14 +20,16 @@ Calculate dataset statistics for LeRobot datasets.
 
 Usage:
     python gr00t/data/stats.py --dataset-path <dataset_path> --embodiment-tag <embodiment_tag>
-    python gr00t/data/stats.py --dataset-path <dataset_path> --embodiment-tag <embodiment_tag> --modality-config-path <config.py>
+    python gr00t/data/stats.py --dataset-path <dataset_path> --embodiment-tag <embodiment_tag> --modality-config-path <config.py> --num-workers 16
 
 Args:
     dataset_path: Path to the dataset.
     embodiment_tag: Embodiment tag to use to load modality configurations.
     modality_config_path: Optional path to a .py config file for custom embodiment tags not in the built-in registry.
+    num_workers: Number of threads/processes used to calculate statistics.
 """
 
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import json
 from pathlib import Path
 
@@ -48,9 +50,15 @@ LE_ROBOT_INFO_FILENAME = "meta/info.json"
 LE_ROBOT_STATS_FILENAME = "meta/stats.json"
 LE_ROBOT_REL_STATS_FILENAME = "meta/relative_stats.json"
 
+_RELATIVE_ACTION_WORKER_LOADER = None
+
+
+def _read_parquet(path: Path, columns: list[str] | None) -> pd.DataFrame:
+    return pd.read_parquet(path, columns=columns)
+
 
 def calculate_dataset_statistics(
-    parquet_paths: list[Path], features: list[str] | None = None
+    parquet_paths: list[Path], features: list[str] | None = None, num_workers: int = 1
 ) -> dict[str, dict[str, float]]:
     """Calculate the dataset statistics of all columns for a list of parquet files.
 
@@ -58,22 +66,29 @@ def calculate_dataset_statistics(
         parquet_paths (list[Path]): List of paths to parquet files to process.
         features (list[str] | None): List of feature names to compute statistics for.
             If None, computes statistics for all columns in the data.
+        num_workers: Number of threads used to read parquet files.
 
     Returns:
         dict[str, DatasetStatisticalValues]: Dictionary mapping feature names to their
             statistical values (mean, std, min, max, q01, q99).
     """
-    # Dataset statistics
-    all_low_dim_data_list = []
-    # Collect all the data
-    for parquet_path in tqdm(
-        sorted(list(parquet_paths)),
-        desc="Collecting all parquet files...",
-    ):
-        # Load the parquet file
-        parquet_data = pd.read_parquet(parquet_path)
-        parquet_data = parquet_data
-        all_low_dim_data_list.append(parquet_data)
+    if num_workers < 1:
+        raise ValueError("num_workers must be at least 1")
+
+    parquet_paths = sorted(parquet_paths)
+    if num_workers == 1:
+        all_low_dim_data_list = [
+            _read_parquet(parquet_path, features)
+            for parquet_path in tqdm(parquet_paths, desc="Collecting all parquet files...")
+        ]
+    else:
+        max_workers = min(num_workers, len(parquet_paths))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            frames = executor.map(_read_parquet, parquet_paths, [features] * len(parquet_paths))
+            all_low_dim_data_list = list(
+                tqdm(frames, total=len(parquet_paths), desc="Collecting all parquet files...")
+            )
+
     all_low_dim_data = pd.concat(all_low_dim_data_list, axis=0)
     # Compute dataset statistics
     dataset_statistics = {}
@@ -112,7 +127,7 @@ def check_stats_validity(dataset_path: Path | str, features: list[str]):
     return True
 
 
-def generate_stats(dataset_path: Path | str):
+def generate_stats(dataset_path: Path | str, num_workers: int = 1):
     dataset_path = Path(dataset_path)
     print(f"Generating stats for {str(dataset_path)}")
     lowdim_features = []
@@ -125,7 +140,7 @@ def generate_stats(dataset_path: Path | str):
         return
 
     parquet_files = list(dataset_path.glob(LE_ROBOT_DATA_FILENAME))
-    stats = calculate_dataset_statistics(parquet_files, lowdim_features)
+    stats = calculate_dataset_statistics(parquet_files, lowdim_features, num_workers=num_workers)
     stats_path = dataset_path / LE_ROBOT_STATS_FILENAME
     with open(stats_path, "w") as f:
         json.dump(stats, f, indent=4)
@@ -160,7 +175,7 @@ class RelativeActionLoader:
         )
         self.loader = LeRobotEpisodeLoader(dataset_path, self.modality_configs)
 
-    def load_relative_actions(self, trajectory_id: int) -> list[np.ndarray]:
+    def load_relative_actions(self, trajectory_id: int) -> np.ndarray:
         df = self.loader[trajectory_id]
 
         # OPTIMIZATION: Extract columns once and convert to numpy arrays
@@ -197,7 +212,7 @@ class RelativeActionLoader:
                 trajectories.append(np.stack([p.joints for p in traj.poses], dtype=np.float32))
             else:
                 raise ValueError(f"Unknown ActionType: {self.action_config.type}")
-        return trajectories
+        return np.stack(trajectories, axis=0)
 
     def __len__(self) -> int:
         return len(self.loader)
@@ -208,13 +223,41 @@ def calculate_stats_for_key(
     embodiment_tag: EmbodimentTag,
     group_key: str,
     max_episodes: int = -1,
+    num_workers: int = 1,
 ) -> dict:
     loader = RelativeActionLoader(dataset_path, embodiment_tag, group_key)
-    trajectories = []
-    for episode_id in tqdm(range(len(loader)), desc=f"Loading trajectories for key {group_key}"):
-        if max_episodes != -1 and episode_id >= max_episodes:
-            break
-        trajectories.extend(loader.load_relative_actions(episode_id))
+    num_episodes = len(loader) if max_episodes == -1 else min(len(loader), max_episodes)
+    episode_ids = range(num_episodes)
+
+    if num_workers < 1:
+        raise ValueError("num_workers must be at least 1")
+
+    if num_workers == 1:
+        episode_trajectories = [
+            loader.load_relative_actions(episode_id)
+            for episode_id in tqdm(
+                episode_ids,
+                total=num_episodes,
+                desc=f"Loading trajectories for key {group_key}",
+            )
+        ]
+    else:
+        max_workers = min(num_workers, num_episodes)
+        modality_config = MODALITY_CONFIGS[embodiment_tag.value]
+        with ProcessPoolExecutor(
+            max_workers=max_workers,
+            initializer=_initialize_relative_action_worker,
+            initargs=(str(dataset_path), embodiment_tag.value, group_key, modality_config),
+        ) as executor:
+            episode_trajectories = list(
+                tqdm(
+                    executor.map(_load_relative_actions_in_worker, episode_ids, chunksize=1),
+                    total=num_episodes,
+                    desc=f"Loading trajectories for key {group_key}",
+                )
+            )
+
+    trajectories = np.concatenate(episode_trajectories, axis=0)
     return {
         "max": np.max(trajectories, axis=0),
         "min": np.min(trajectories, axis=0),
@@ -225,7 +268,47 @@ def calculate_stats_for_key(
     }
 
 
-def generate_rel_stats(dataset_path: Path | str, embodiment_tag: EmbodimentTag) -> None:
+def _initialize_relative_action_worker(
+    dataset_path: str,
+    embodiment_tag: str,
+    action_key: str,
+    modality_config: dict[str, ModalityConfig],
+) -> None:
+    global _RELATIVE_ACTION_WORKER_LOADER
+
+    if embodiment_tag not in MODALITY_CONFIGS:
+        MODALITY_CONFIGS[embodiment_tag] = modality_config
+    _RELATIVE_ACTION_WORKER_LOADER = RelativeActionLoader(
+        dataset_path, EmbodimentTag(embodiment_tag), action_key
+    )
+
+
+def _load_relative_actions_in_worker(episode_id: int) -> np.ndarray:
+    if _RELATIVE_ACTION_WORKER_LOADER is None:
+        raise RuntimeError("Relative action worker was not initialized")
+    return _RELATIVE_ACTION_WORKER_LOADER.load_relative_actions(episode_id)
+
+
+def _relative_stats_match_horizon(stats: dict, action_key: str, horizon: int) -> bool:
+    if action_key not in stats or not isinstance(stats[action_key], dict):
+        return False
+    for stat_name in ("max", "min", "q01", "q99", "mean", "std"):
+        values = stats[action_key].get(stat_name)
+        if not isinstance(values, list) or len(values) != horizon:
+            return False
+    return True
+
+
+def _write_json_atomic(path: Path, data: dict) -> None:
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    with open(temporary_path, "w") as f:
+        json.dump(to_json_serializable(data), f, indent=4)
+    temporary_path.replace(path)
+
+
+def generate_rel_stats(
+    dataset_path: Path | str, embodiment_tag: EmbodimentTag, num_workers: int = 1
+) -> None:
     dataset_path = Path(dataset_path)
     action_config = MODALITY_CONFIGS[embodiment_tag.value]["action"]
     if action_config.action_configs is None:
@@ -241,19 +324,27 @@ def generate_rel_stats(dataset_path: Path | str, embodiment_tag: EmbodimentTag) 
             stats = json.load(f)
     else:
         stats = {}
+    action_horizon = len(action_config.delta_indices)
     for action_key in sorted(action_keys):
-        if action_key in stats:
+        if _relative_stats_match_horizon(stats, action_key, action_horizon):
             continue
+        if action_key in stats:
+            print(
+                f"Regenerating relative stats for {action_key}: existing horizon does not "
+                f"match configured horizon {action_horizon}"
+            )
         print(f"Generating relative stats for {dataset_path} {embodiment_tag} {action_key}")
-        stats[action_key] = calculate_stats_for_key(dataset_path, embodiment_tag, action_key)
-    with open(stats_path, "w") as f:
-        json.dump(to_json_serializable(dict(stats)), f, indent=4)
+        stats[action_key] = calculate_stats_for_key(
+            dataset_path, embodiment_tag, action_key, num_workers=num_workers
+        )
+        _write_json_atomic(stats_path, stats)
 
 
 def main(
     dataset_path: Path | str,
     embodiment_tag: EmbodimentTag,
     modality_config_path: str | None = None,
+    num_workers: int = 1,
 ):
     """Generate dataset statistics.
 
@@ -262,7 +353,11 @@ def main(
         embodiment_tag: Embodiment tag for modality configurations.
         modality_config_path: Optional path to a .py modality config file. Required for custom
             embodiment tags not in the built-in MODALITY_CONFIGS registry.
+        num_workers: Number of threads/processes used to calculate statistics.
     """
+    if num_workers < 1:
+        raise ValueError("num_workers must be at least 1")
+
     if modality_config_path is not None:
         import importlib
         import sys
@@ -276,8 +371,8 @@ def main(
             raise FileNotFoundError(
                 f"Modality config path does not exist or is not a .py file: {modality_config_path}"
             )
-    generate_stats(dataset_path)
-    generate_rel_stats(dataset_path, embodiment_tag)
+    generate_stats(dataset_path, num_workers=num_workers)
+    generate_rel_stats(dataset_path, embodiment_tag, num_workers=num_workers)
 
 
 if __name__ == "__main__":

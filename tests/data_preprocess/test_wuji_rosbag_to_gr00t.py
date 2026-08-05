@@ -6,6 +6,7 @@ from data_preprocess.wuji_rosbag_to_gr00t import (
     CUSTOM_MSG_DEFINITIONS,
     DEFAULT_TOPICS,
     AlignedEpisode,
+    EpisodeConversionResult,
     EpisodeConversionTask,
     LowPassFilterConfig,
     TimedSample,
@@ -13,6 +14,8 @@ from data_preprocess.wuji_rosbag_to_gr00t import (
     _apply_low_pass_filter,
     _build_rosbags_typestore,
     _clamp_timestamps_for_video_indexing,
+    _delete_episode_files,
+    _filter_and_compact_episodes_by_quality,
     _joint_sample,
     _low_pass_filter_samples,
     _make_low_pass_filter_config,
@@ -294,10 +297,13 @@ def test_align_episode_trims_idle_frames_with_joint_action_space(monkeypatch, tm
         ),
     )
 
-    assert episode.action.shape == (2, 22)
-    np.testing.assert_array_equal(episode.timestamps, np.array([0.0, 1.0], dtype=np.float32))
+    assert episode.action.shape == (3, 22)
+    np.testing.assert_array_equal(
+        episode.timestamps,
+        np.array([0.0, 1.0, 2.0], dtype=np.float32),
+    )
     assert episode.motion_detection_result.idle_prefix_frames == 1
-    assert episode.motion_detection_result.idle_suffix_frames == 2
+    assert episode.motion_detection_result.idle_suffix_frames == 1
 
 
 def test_joint_action_space_motion_detection_uses_eef_streams(monkeypatch, tmp_path):
@@ -506,6 +512,94 @@ def test_prepare_video_frame_resizes_only_when_size_is_explicit():
     prepared = _prepare_video_frame(frame, (320, 240))
 
     assert prepared.shape == (240, 320, 3)
+
+
+def test_delete_episode_files_only_deletes_target_episode(tmp_path):
+    data_dir = tmp_path / "data/chunk-000"
+    data_dir.mkdir(parents=True)
+    target_data = data_dir / "episode_000001.parquet"
+    kept_data = data_dir / "episode_000002.parquet"
+    target_data.touch()
+    kept_data.touch()
+
+    target_videos = []
+    kept_videos = []
+    for modality_key in ["head_view", "left_wrist_view", "right_wrist_view"]:
+        video_dir = tmp_path / "videos/chunk-000" / f"observation.images.{modality_key}"
+        video_dir.mkdir(parents=True)
+        target_video = video_dir / "episode_000001.mp4"
+        kept_video = video_dir / "episode_000002.mp4"
+        target_video.touch()
+        kept_video.touch()
+        target_videos.append(target_video)
+        kept_videos.append(kept_video)
+
+    _delete_episode_files(tmp_path, episode_index=1, chunks_size=1000)
+
+    assert not target_data.exists()
+    assert all(not path.exists() for path in target_videos)
+    assert kept_data.exists()
+    assert all(path.exists() for path in kept_videos)
+
+
+def test_quality_filter_delete_policy_removes_failed_episode_and_compacts_kept_one(tmp_path):
+    pd = pytest.importorskip("pandas")
+    data_dir = tmp_path / "data/chunk-000"
+    data_dir.mkdir(parents=True)
+    results = []
+    for episode_index in range(2):
+        parquet_path = data_dir / f"episode_{episode_index:06d}.parquet"
+        pd.DataFrame(
+            {
+                "episode_index": np.full(2, episode_index, dtype=np.int64),
+                "frame_index": np.arange(2, dtype=np.int64),
+                "index": np.arange(episode_index * 2, episode_index * 2 + 2, dtype=np.int64),
+            }
+        ).to_parquet(parquet_path, index=False)
+        for modality_key in ["head_view", "left_wrist_view", "right_wrist_view"]:
+            video_dir = tmp_path / "videos/chunk-000" / f"observation.images.{modality_key}"
+            video_dir.mkdir(parents=True, exist_ok=True)
+            (video_dir / f"episode_{episode_index:06d}.mp4").touch()
+        results.append(
+            EpisodeConversionResult(
+                episode_index=episode_index,
+                length=2,
+                source=f"bag-{episode_index}",
+                fps=30.0,
+                max_skew=0.1 if episode_index == 0 else 0.01,
+                camera_frame_count=2,
+                hand_feature_names={},
+                video_shapes={},
+                parquet_path=parquet_path,
+                written_global_start_index=episode_index * 2,
+                original_length=2,
+            )
+        )
+
+    failed_metrics = SimpleNamespace(
+        episode_index=0,
+        max_skew_sec=0.1,
+        filter_reasons=["max_skew (0.1000s) > threshold (0.06s)"],
+    )
+    kept, _, total_frames = _filter_and_compact_episodes_by_quality(
+        output_dir=tmp_path,
+        results=results,
+        quality_metrics=[failed_metrics],
+        max_skew_threshold=0.06,
+        chunks_size=1000,
+        filtered_episode_policy="delete",
+    )
+
+    assert len(kept) == 1
+    assert kept[0].episode_index == 0
+    assert kept[0].source == "bag-1"
+    assert total_frames == 2
+    assert not (data_dir / "episode_000001.parquet").exists()
+    compacted = pd.read_parquet(data_dir / "episode_000000.parquet")
+    np.testing.assert_array_equal(compacted["episode_index"], np.array([0, 0]))
+    np.testing.assert_array_equal(compacted["index"], np.array([0, 1]))
+    report = json.loads((tmp_path / "meta/deleted_episodes.json").read_text())
+    assert report[0]["source"] == "bag-0"
 
 
 def test_message_timestamp_uses_header_stamp_by_default():

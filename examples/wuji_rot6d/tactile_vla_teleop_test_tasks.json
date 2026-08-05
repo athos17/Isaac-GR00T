@@ -1,0 +1,35 @@
+{
+  "version": "wuji_task_config_v1",
+  "tasks": [
+    {
+      "task_name": "grasp_water_bottle",
+      "task_dir": "/data_all/share/datasets/tactile_vla/teleop_test/grasp_water_bottle",
+      "global_task_instruction": "grasp the water bottle and place it into the basket"
+    },
+    {
+      "task_name": "spray_water",
+      "task_dir": "/data_all/share/datasets/tactile_vla/teleop_test/spray_water",
+      "global_task_instruction": "Pick up the spray bottle, pump it to build up pressure, then spray water on the flowers"
+    },
+    {
+      "task_name": "stack_cups",
+      "task_dir": "/data_all/share/datasets/tactile_vla/teleop_test/stack_cups",
+      "global_task_instruction": "Pick up the four cups one by one and place them on the cup rack."
+    },
+    {
+      "task_name": "grasp_milktea_bottle",
+      "task_dir": "/data_all/share/datasets/tactile_vla/teleop_test/grasp_milktea_bottle",
+      "global_task_instruction": "grasp the milktea bottle and place it into the basket"
+    },
+    {
+      "task_name": "wipe_cup",
+      "task_dir": "/data_all/share/datasets/tactile_vla/teleop_test/wipe_cup",
+      "global_task_instruction": "Pick up the cup, wipe it with the rag, then place the cup and rag down."
+    },
+    {
+      "task_name": "scrub_pan",
+      "task_dir": "/data_all/share/datasets/tactile_vla/teleop_test/scrub_pan",
+      "global_task_instruction": "Scrub the pan with the rag and place the rag back."
+    }
+  ]
+}

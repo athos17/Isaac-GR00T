@@ -117,6 +117,37 @@ python data_preprocess/wuji_rosbag_to_gr00t.py \
 
 这只影响 MP4 容器和 metadata 的 FPS，不改变 head timestamp anchor 对齐策略。
 
+### 可选：指令低通滤波
+
+默认不做滤波。需要在数据处理阶段按一阶低通/EMA 平滑指令时，可以传：
+
+```bash
+--enable-low-pass-filter --filter-scale 0.3
+```
+
+滤波公式为：
+
+```text
+filtered_t = (1 - filter_scale) * filtered_{t-1} + filter_scale * value_t
+```
+
+`filter_scale` 取值范围是 `[0, 1]`：越大越跟随最新指令，越小越平滑但滞后更大。
+开启后默认只滤四个 action stream：
+
+- `left_eef_action`：`/astribot_arm_left/endpoint_desired_states`
+- `right_eef_action`：`/astribot_arm_right/endpoint_desired_states`
+- `left_hand_action`：`/left_hand/joint_commands`
+- `right_hand_action`：`/right_hand/joint_commands`
+
+如果确实需要改滤波范围，可以重复传 `--low-pass-filter-stream` 覆盖默认值，例如只滤手部指令：
+
+```bash
+--enable-low-pass-filter \
+  --filter-scale 0.3 \
+  --low-pass-filter-stream left_hand_action \
+  --low-pass-filter-stream right_hand_action
+```
+
 默认保留各相机的原始图像分辨率写入 MP4。需要在转换阶段统一视频尺寸时，显式传入：
 
 ```bash

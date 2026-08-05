@@ -22,6 +22,7 @@ class MotionDetectionConfig:
     velocity_threshold: float = 0.01  # m/s, combined EEF velocity threshold
     hand_velocity_threshold: float = 0.05  # rad/s, hand joint velocity threshold
     action_state_diff_threshold: float = 0.02  # Threshold for action-state mismatch
+    use_action_state_diff: bool = True  # Include action-state mismatch in the motion signal
     window_duration_sec: float = 0.5  # Duration of sliding window for smoothing
     min_motion_frames: int = 30  # Minimum frames to consider valid motion
     fps: float = 30.0  # Expected FPS for velocity computation
@@ -110,7 +111,14 @@ def detect_motion_window(
         MotionDetectionResult with detected motion window and statistics
     """
     T = len(state)
-    window_frames = int(config.window_duration_sec * config.fps)
+    if config.velocity_threshold <= 0:
+        raise ValueError("velocity_threshold must be > 0")
+    if config.hand_velocity_threshold <= 0:
+        raise ValueError("hand_velocity_threshold must be > 0")
+    if config.use_action_state_diff and config.action_state_diff_threshold <= 0:
+        raise ValueError("action_state_diff_threshold must be > 0 when enabled")
+
+    window_frames = max(1, int(config.window_duration_sec * config.fps))
 
     if state_layout == "eef":
         # Extract left and right EEF xyz (first 3 dimensions of each EEF)
@@ -148,14 +156,16 @@ def detect_motion_window(
         action_state_diff = np.zeros(T, dtype=np.float32)
     action_state_diff_vel = action_state_diff[:-1]  # Align with velocity (T-1,)
 
-    # Combine all motion signals
-    motion_signal = np.maximum.reduce(
-        [
-            combined_eef_vel / config.velocity_threshold,
-            hand_vel / config.hand_velocity_threshold,
-            action_state_diff_vel / config.action_state_diff_threshold,
-        ]
-    )  # (T-1,)
+    # Combine enabled motion signals. Absolute desired actions can maintain a non-zero tracking
+    # error while the robot is stationary, so callers may disable action-state mismatch and rely
+    # only on observed EEF/hand velocities for idle trimming.
+    motion_signals = [
+        combined_eef_vel / config.velocity_threshold,
+        hand_vel / config.hand_velocity_threshold,
+    ]
+    if config.use_action_state_diff:
+        motion_signals.append(action_state_diff_vel / config.action_state_diff_threshold)
+    motion_signal = np.maximum.reduce(motion_signals)  # (T-1,)
 
     # Apply sliding window smoothing
     if len(motion_signal) >= window_frames:
@@ -179,7 +189,9 @@ def detect_motion_window(
         )
 
     motion_start = motion_indices[0]
-    motion_end = motion_indices[-1] + window_frames  # Add back window offset
+    # motion_signal describes transitions between state frames and therefore has length T-1.
+    # Include the state frame reached by the last transition; the returned end is exclusive.
+    motion_end = motion_indices[-1] + window_frames + 1
 
     # Ensure minimum motion duration
     if motion_end - motion_start < config.min_motion_frames:
@@ -195,12 +207,13 @@ def detect_motion_window(
         )
 
     # Compute statistics for the detected motion window
-    motion_eef_vel = combined_eef_vel[motion_start:motion_end]
+    motion_end = min(motion_end, T)
+    motion_eef_vel = combined_eef_vel[motion_start : motion_end - 1]
     motion_action_state_diff = action_state_diff[motion_start:motion_end]
 
     return MotionDetectionResult(
         motion_start_index=motion_start,
-        motion_end_index=min(motion_end, T),
+        motion_end_index=motion_end,
         idle_prefix_frames=motion_start,
         idle_suffix_frames=max(0, T - motion_end),
         mean_eef_velocity=float(np.mean(motion_eef_vel)) if len(motion_eef_vel) > 0 else 0.0,

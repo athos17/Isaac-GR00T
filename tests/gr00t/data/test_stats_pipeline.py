@@ -38,6 +38,13 @@ from gr00t.data.stats import (
     generate_rel_stats,
     generate_stats,
 )
+from gr00t.data.types import (
+    ActionConfig,
+    ActionFormat,
+    ActionRepresentation,
+    ActionType,
+    ModalityConfig,
+)
 import numpy as np
 import pyarrow.parquet as pq
 import pytest
@@ -247,3 +254,57 @@ class TestGenerateRelStats:
         )
         generate_rel_stats(tmp_dataset, EMBODIMENT)
         assert not rel_stats_path.exists(), "Idempotency broken on second call"
+
+
+class TestParallelRelativeStats:
+    def test_regenerates_stats_when_action_horizon_changes(self, tmp_path, monkeypatch):
+        from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
+        import gr00t.data.stats as stats_module
+
+        embodiment = EmbodimentTag.NEW_EMBODIMENT
+        modality_config = {
+            "action": ModalityConfig(
+                delta_indices=list(range(32)),
+                modality_keys=["eef"],
+                action_configs=[
+                    ActionConfig(
+                        rep=ActionRepresentation.RELATIVE,
+                        type=ActionType.EEF,
+                        format=ActionFormat.XYZ_ROT6D,
+                    )
+                ],
+            )
+        }
+        monkeypatch.setitem(MODALITY_CONFIGS, embodiment.value, modality_config)
+
+        meta_dir = tmp_path / "meta"
+        meta_dir.mkdir()
+        stats_path = meta_dir / "relative_stats.json"
+        old_stats = {
+            "eef": {
+                stat_name: np.zeros((16, 9), dtype=np.float32).tolist()
+                for stat_name in ("max", "min", "q01", "q99", "mean", "std")
+            }
+        }
+        stats_path.write_text(json.dumps(old_stats))
+
+        calls = []
+
+        def fake_calculate_stats_for_key(
+            dataset_path, embodiment_tag, group_key, max_episodes=-1, num_workers=1
+        ):
+            calls.append((dataset_path, embodiment_tag, group_key, max_episodes, num_workers))
+            return {
+                stat_name: np.zeros((32, 9), dtype=np.float32)
+                for stat_name in ("max", "min", "q01", "q99", "mean", "std")
+            }
+
+        monkeypatch.setattr(stats_module, "calculate_stats_for_key", fake_calculate_stats_for_key)
+
+        generate_rel_stats(tmp_path, embodiment, num_workers=7)
+
+        assert calls == [(tmp_path, embodiment, "eef", -1, 7)]
+        regenerated = json.loads(stats_path.read_text())
+        assert len(regenerated["eef"]["max"]) == 32
+        assert len(regenerated["eef"]["max"][0]) == 9
+        assert not (meta_dir / ".relative_stats.json.tmp").exists()

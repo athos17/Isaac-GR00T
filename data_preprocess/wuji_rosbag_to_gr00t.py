@@ -16,6 +16,7 @@ import math
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 from typing import Any, Literal
 
@@ -24,14 +25,12 @@ import numpy as np
 import pandas as pd
 import yaml
 
+
 # Try multiple import strategies for motion detection modules
 MOTION_DETECTION_AVAILABLE = False
 
 # Add current directory and parent directory to path for imports
-import sys
-from pathlib import Path as _ImportPath
-
-_script_dir = _ImportPath(__file__).parent
+_script_dir = Path(__file__).parent
 _project_root = _script_dir.parent
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
@@ -42,12 +41,10 @@ try:
     # Try relative import first (when run as module)
     from .motion_detection import (
         MotionDetectionConfig,
-        MotionDetectionResult,
         detect_motion_window,
         trim_episode_to_motion,
     )
     from .quality_report import (
-        EpisodeQualityMetrics,
         create_dataset_summary,
         create_episode_quality_metrics,
         write_quality_report,
@@ -59,12 +56,10 @@ except ImportError:
         # Try absolute import (when run as script from project root)
         from data_preprocess.motion_detection import (
             MotionDetectionConfig,
-            MotionDetectionResult,
             detect_motion_window,
             trim_episode_to_motion,
         )
         from data_preprocess.quality_report import (
-            EpisodeQualityMetrics,
             create_dataset_summary,
             create_episode_quality_metrics,
             write_quality_report,
@@ -76,12 +71,10 @@ except ImportError:
             # Try direct import from same directory
             from motion_detection import (
                 MotionDetectionConfig,
-                MotionDetectionResult,
                 detect_motion_window,
                 trim_episode_to_motion,
             )
             from quality_report import (
-                EpisodeQualityMetrics,
                 create_dataset_summary,
                 create_episode_quality_metrics,
                 write_quality_report,
@@ -148,6 +141,7 @@ FILTERABLE_STREAM_KEYS = (
 )
 TimestampSource = Literal["header", "rosbag"]
 ActionSpace = Literal["eef", "joint"]
+FilteredEpisodePolicy = Literal["move", "delete"]
 
 CUSTOM_MSG_DEFINITIONS = {
     "astribot_msgs/msg/RobotCartesianState": """\
@@ -857,7 +851,9 @@ def _build_streams(
             if state_dim != action_dim
         }
         if mismatched_hands:
-            raise ValueError(f"Hand state/action dimensions must match for metadata: {mismatched_hands}")
+            raise ValueError(
+                f"Hand state/action dimensions must match for metadata: {mismatched_hands}"
+            )
         for key in JOINT_SPACE_KEYS:
             names_dim = len(joint_feature_names[key])
             state_dim = joint_dim_pairs[key][0]
@@ -1818,6 +1814,24 @@ def _move_episode_files(
             shutil.move(str(video_file), str(dest_video_subdir / video_file.name))
 
 
+def _delete_episode_files(
+    output_dir: Path,
+    episode_index: int,
+    chunks_size: int,
+) -> None:
+    """Delete one filtered episode's parquet and videos without touching adjacent episodes."""
+    episode_chunk = episode_index // chunks_size
+    episode_name = f"episode_{episode_index:06d}"
+
+    data_file = output_dir / "data" / f"chunk-{episode_chunk:03d}" / f"{episode_name}.parquet"
+    data_file.unlink(missing_ok=True)
+
+    video_base = output_dir / "videos" / f"chunk-{episode_chunk:03d}"
+    for modality_key in VIDEO_MODALITY_KEYS.values():
+        video_file = video_base / f"observation.images.{modality_key}" / f"{episode_name}.mp4"
+        video_file.unlink(missing_ok=True)
+
+
 def _move_kept_episode_to_compact_index(
     output_dir: Path,
     result: EpisodeConversionResult,
@@ -1878,8 +1892,12 @@ def _filter_and_compact_episodes_by_quality(
     quality_metrics: list[Any],
     max_skew_threshold: float,
     chunks_size: int,
+    filtered_episode_policy: FilteredEpisodePolicy = "move",
 ) -> tuple[list[EpisodeConversionResult], list[Any], int]:
-    """Move failed episodes out and compact kept episode ids plus global frame indices."""
+    """Discard failed episodes and compact kept episode ids plus global frame indices."""
+    if filtered_episode_policy not in {"move", "delete"}:
+        raise ValueError(f"Unsupported filtered episode policy: {filtered_episode_policy}")
+
     metrics_by_episode = {metrics.episode_index: metrics for metrics in quality_metrics}
     failed_reasons = {
         result.episode_index: _quality_filter_reasons(
@@ -1895,19 +1913,27 @@ def _filter_and_compact_episodes_by_quality(
         return results, quality_metrics, sum(result.length for result in results)
 
     filtered_out_dir = output_dir / "filtered_out"
-    filtered_out_dir.mkdir(parents=True, exist_ok=True)
+    if filtered_episode_policy == "move":
+        filtered_out_dir.mkdir(parents=True, exist_ok=True)
 
     filter_report = []
     for result in results:
         if result.episode_index not in failed_reasons:
             continue
         metrics = metrics_by_episode.get(result.episode_index)
-        _move_episode_files(
-            output_dir,
-            episode_index=result.episode_index,
-            chunks_size=chunks_size,
-            dest_root=filtered_out_dir,
-        )
+        if filtered_episode_policy == "move":
+            _move_episode_files(
+                output_dir,
+                episode_index=result.episode_index,
+                chunks_size=chunks_size,
+                dest_root=filtered_out_dir,
+            )
+        else:
+            _delete_episode_files(
+                output_dir,
+                episode_index=result.episode_index,
+                chunks_size=chunks_size,
+            )
         filter_report.append(
             {
                 "episode_index": result.episode_index,
@@ -1945,16 +1971,23 @@ def _filter_and_compact_episodes_by_quality(
             )
         global_frame_index += result.length
 
-    filter_report_path = filtered_out_dir / "filter_report.json"
+    if filtered_episode_policy == "move":
+        filter_report_path = filtered_out_dir / "filter_report.json"
+    else:
+        filter_report_path = output_dir / "meta" / "deleted_episodes.json"
+        filter_report_path.parent.mkdir(parents=True, exist_ok=True)
     with filter_report_path.open("w", encoding="utf-8") as f:
         json.dump(filter_report, f, indent=2)
 
-    print(f"  ✓ Moved {len(filter_report)} failed episodes to {filtered_out_dir}")
+    if filtered_episode_policy == "move":
+        print(f"  ✓ Moved {len(filter_report)} failed episodes to {filtered_out_dir}")
+    else:
+        print(f"  ✓ Deleted {len(filter_report)} failed episodes")
     print(
         f"  ✓ Compacted kept episodes to {len(kept_results)} episodes / {global_frame_index} frames"
     )
     print(f"  ✓ Wrote filter report to {filter_report_path}")
-    print(f"\n  Failed episodes breakdown:")
+    print("\n  Failed episodes breakdown:")
     for reason_key in ["max_skew", "too short", "low motion"]:
         count = sum(
             1 for reasons in failed_reasons.values() if any(reason_key in r for r in reasons)
@@ -2233,13 +2266,15 @@ def convert(args: argparse.Namespace) -> None:
                 velocity_threshold=args.motion_velocity_threshold,
                 hand_velocity_threshold=args.motion_hand_velocity_threshold,
                 action_state_diff_threshold=args.motion_action_state_diff_threshold,
+                use_action_state_diff=not args.disable_motion_action_state_diff,
                 window_duration_sec=args.motion_window_sec,
                 min_motion_frames=args.motion_min_frames,
                 fps=args.output_fps if args.output_fps else 30.0,
             )
             print(
                 f"Motion detection enabled: velocity_threshold={args.motion_velocity_threshold} m/s, "
-                f"window={args.motion_window_sec}s"
+                f"window={args.motion_window_sec}s, "
+                f"use_action_state_diff={not args.disable_motion_action_state_diff}"
             )
 
     if args.num_workers == 1:
@@ -2291,6 +2326,7 @@ def convert(args: argparse.Namespace) -> None:
             quality_metrics_list,
             filter_threshold,
             args.chunks_size,
+            args.filtered_episode_policy,
         )
         episode_fps_values = [result.fps for result in results]
 
@@ -2340,7 +2376,7 @@ def convert(args: argparse.Namespace) -> None:
     if args.generate_stats:
         print("\nGenerating dataset statistics...")
         try:
-            from gr00t.data.stats import generate_stats, generate_rel_stats
+            from gr00t.data.stats import generate_rel_stats, generate_stats
             from gr00t.data.types import EmbodimentTag
 
             if args.modality_config_path:
@@ -2385,14 +2421,14 @@ def convert(args: argparse.Namespace) -> None:
         print("\nSkipping automatic stats generation (use --generate-stats to enable)")
         print("To generate stats manually, run in your gr00t environment:")
         if args.modality_config_path:
-            print(f"  python gr00t/data/stats.py \\")
+            print("  python gr00t/data/stats.py \\")
             print(f"    --dataset-path {output_dir} \\")
-            print(f"    --embodiment-tag NEW_EMBODIMENT \\")
+            print("    --embodiment-tag NEW_EMBODIMENT \\")
             print(f"    --modality-config-path {args.modality_config_path}")
         else:
-            print(f"  python gr00t/data/stats.py \\")
+            print("  python gr00t/data/stats.py \\")
             print(f"    --dataset-path {output_dir} \\")
-            print(f"    --embodiment-tag NEW_EMBODIMENT")
+            print("    --embodiment-tag NEW_EMBODIMENT")
 
 
 def parse_args() -> argparse.Namespace:
@@ -2456,7 +2492,17 @@ def parse_args() -> argparse.Namespace:
         "--filter-by-quality",
         action="store_true",
         default=False,
-        help="Move episodes that fail quality checks to a separate 'filtered_out' directory.",
+        help="Exclude episodes that fail quality checks and compact the remaining dataset.",
+    )
+    parser.add_argument(
+        "--filtered-episode-policy",
+        choices=["move", "delete"],
+        default="move",
+        help=(
+            "How to handle episodes rejected by --filter-by-quality. `move` preserves them "
+            "under filtered_out; `delete` removes their parquet/videos and keeps only an audit "
+            "report under meta/. Default: move."
+        ),
     )
     parser.add_argument(
         "--quality-max-skew",
@@ -2515,6 +2561,15 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.02,
         help="Action-state difference threshold for motion detection. Default: 0.02",
+    )
+    parser.add_argument(
+        "--disable-motion-action-state-diff",
+        action="store_true",
+        default=False,
+        help=(
+            "Exclude action-state mismatch from the motion signal and detect idle sections using "
+            "observed EEF/hand velocities only. Recommended for absolute desired actions."
+        ),
     )
     parser.add_argument(
         "--motion-window-sec",
