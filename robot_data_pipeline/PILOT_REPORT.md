@@ -73,6 +73,24 @@ The 20 ms wrist skew threshold is retained. It separates these dropped-frame eve
 normal approximately 16 ms nearest-frame tail. Rejection reports now include the stream, anchor
 and source timestamps, signed and absolute skew, maximum skew, threshold, and violation count.
 
+The revised policy keeps an isolated nearest-neighbor match between 20 and 40 ms as
+`PASS_WITH_WARNING` only when no more than one violating anchor is consecutive and no more than
+0.5% of the episode's anchors violate 20 ms. A match above 40 ms, a longer run, or a larger ratio
+still rejects the episode. Head anchors outside required stream coverage at an activity boundary
+are trimmed instead of rejecting the full episode.
+
+A targeted replay of all 20 episodes previously rejected for wrist skew produced 18 recoveries:
+15 `PASS_WITH_WARNING` episodes with isolated missing wrist frames and 3 plain `PASS` episodes
+after boundary trimming. Two episodes remain rejected by the 0.5% ratio guard:
+
+| Roster | Soft violations | Ratio | Maximum consecutive | Decision |
+| --- | ---: | ---: | ---: | --- |
+| 81 | 7 / 566 | 1.2367% | 1 | REJECT |
+| 96 | 4 / 526 | 0.7605% | 1 | REJECT |
+
+This preserves the occasional duplicated nearest-neighbor wrist image while continuing to reject
+episodes where frame loss is too frequent to be treated as an isolated acquisition artifact.
+
 ## Manus and Orin status
 
 Synthetic rosbag coverage verifies 30/120/200/250 Hz streams with the Manus profile. The search

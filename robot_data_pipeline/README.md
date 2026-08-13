@@ -67,5 +67,11 @@ conversion quality directories with:
 python -m robot_data_pipeline summarize --quality-dir /path/to/quality-or-audit-directory
 ```
 
+Wrist-camera nearest-neighbor alignment uses a two-level policy. Skew up to 20 ms is normal;
+isolated 20-40 ms matches may pass with a `wrist_camera_skew_warning` when their configured ratio
+and consecutive-frame limits are satisfied. Matches above 40 ms, consecutive soft violations, or
+an excessive violation ratio reject the episode. Head anchors outside the soft-skew coverage of a
+required wrist camera are trimmed at episode boundaries instead of rejecting the full episode.
+
 Legacy pilot results and the outstanding confirmed Manus + Orin data requirement are recorded in
 `robot_data_pipeline/PILOT_REPORT.md`.

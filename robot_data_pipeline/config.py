@@ -213,6 +213,9 @@ def load_robot_profile(path: Path | str) -> RobotProfile:
             ),
             optional=(
                 "max_skew_sec",
+                "hard_max_skew_sec",
+                "max_consecutive_skew_violations",
+                "max_skew_violation_ratio",
                 "max_gap_sec",
                 "max_action_age_sec",
                 "names",
@@ -304,6 +307,18 @@ def load_robot_profile(path: Path | str) -> RobotProfile:
                 raise ConfigError(f"streams.{stream_key} camera smoothing is not supported")
             if alignment == "nearest" and "max_skew_sec" not in item:
                 raise ConfigError(f"streams.{stream_key}.max_skew_sec is required")
+            if alignment == "nearest":
+                required_policy = {
+                    "hard_max_skew_sec",
+                    "max_consecutive_skew_violations",
+                    "max_skew_violation_ratio",
+                }
+                missing_policy = sorted(required_policy - item.keys())
+                if missing_policy:
+                    raise ConfigError(
+                        f"streams.{stream_key} is missing wrist skew policy fields: "
+                        f"{missing_policy}"
+                    )
         else:
             if not names and semantic.startswith("joint_position"):
                 raise ConfigError(f"streams.{stream_key}.names must not be empty")
@@ -336,6 +351,42 @@ def load_robot_profile(path: Path | str) -> RobotProfile:
             _nonempty_string(item.get("tool_frame"), f"streams.{stream_key}.tool_frame")
         if item["required"] and "max_gap_sec" not in item:
             raise ConfigError(f"streams.{stream_key}.max_gap_sec is required")
+        max_skew_sec = (
+            _positive_float(item["max_skew_sec"], f"streams.{stream_key}.max_skew_sec")
+            if "max_skew_sec" in item
+            else None
+        )
+        hard_max_skew_sec = (
+            _positive_float(item["hard_max_skew_sec"], f"streams.{stream_key}.hard_max_skew_sec")
+            if "hard_max_skew_sec" in item
+            else None
+        )
+        max_consecutive_skew_violations = item.get("max_consecutive_skew_violations")
+        if max_consecutive_skew_violations is not None and (
+            not isinstance(max_consecutive_skew_violations, int)
+            or isinstance(max_consecutive_skew_violations, bool)
+            or max_consecutive_skew_violations < 0
+        ):
+            raise ConfigError(
+                f"streams.{stream_key}.max_consecutive_skew_violations must be a "
+                "non-negative integer"
+            )
+        max_skew_violation_ratio = item.get("max_skew_violation_ratio")
+        if max_skew_violation_ratio is not None:
+            max_skew_violation_ratio = _nonnegative_float(
+                max_skew_violation_ratio,
+                f"streams.{stream_key}.max_skew_violation_ratio",
+            )
+            if max_skew_violation_ratio > 1:
+                raise ConfigError(
+                    f"streams.{stream_key}.max_skew_violation_ratio must be at most 1"
+                )
+        if (
+            max_skew_sec is not None
+            and hard_max_skew_sec is not None
+            and hard_max_skew_sec <= max_skew_sec
+        ):
+            raise ConfigError(f"streams.{stream_key}.hard_max_skew_sec must exceed max_skew_sec")
         streams[stream_key] = StreamConfig(
             key=stream_key,
             topic=topic,
@@ -347,11 +398,10 @@ def load_robot_profile(path: Path | str) -> RobotProfile:
             required=item["required"],
             expected_hz=_positive_float(item["expected_hz"], f"streams.{stream_key}.expected_hz"),
             alignment=alignment,
-            max_skew_sec=(
-                _positive_float(item["max_skew_sec"], f"streams.{stream_key}.max_skew_sec")
-                if "max_skew_sec" in item
-                else None
-            ),
+            max_skew_sec=max_skew_sec,
+            hard_max_skew_sec=hard_max_skew_sec,
+            max_consecutive_skew_violations=max_consecutive_skew_violations,
+            max_skew_violation_ratio=max_skew_violation_ratio,
             max_gap_sec=(
                 _positive_float(item["max_gap_sec"], f"streams.{stream_key}.max_gap_sec")
                 if "max_gap_sec" in item

@@ -20,6 +20,11 @@ def test_legacy_profile_is_complete() -> None:
     assert len(profile.streams) == 15
     assert profile.streams["state.left_arm_joint"].allow_unnamed is True
     assert profile.streams["state.left_hand_joint"].expected_hz == 200
+    wrist = profile.streams["video.left_wrist"]
+    assert wrist.max_skew_sec == 0.02
+    assert wrist.hard_max_skew_sec == 0.04
+    assert wrist.max_consecutive_skew_violations == 1
+    assert wrist.max_skew_violation_ratio == 0.005
 
 
 def test_manus_profile_resolves_with_120_hz_hand_commands() -> None:
@@ -73,6 +78,26 @@ def test_v1_clock_contract_is_enforced(tmp_path: Path, old: str, new: str, match
     ],
 )
 def test_unsupported_profile_semantics_are_rejected(tmp_path, old, new, match) -> None:
+    profile_path = tmp_path / "profile.yaml"
+    profile_path.write_text(PROFILE.read_text().replace(old, new, 1))
+
+    with pytest.raises(ConfigError, match=match):
+        load_robot_profile(profile_path)
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "match"),
+    [
+        ("hard_max_skew_sec: 0.04", "hard_max_skew_sec: 0.02", "must exceed"),
+        (
+            "max_consecutive_skew_violations: 1",
+            "max_consecutive_skew_violations: -1",
+            "non-negative integer",
+        ),
+        ("max_skew_violation_ratio: 0.005", "max_skew_violation_ratio: 1.1", "at most 1"),
+    ],
+)
+def test_invalid_wrist_skew_policy_is_rejected(tmp_path, old, new, match) -> None:
     profile_path = tmp_path / "profile.yaml"
     profile_path.write_text(PROFILE.read_text().replace(old, new, 1))
 

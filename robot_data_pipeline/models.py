@@ -33,6 +33,9 @@ class StreamConfig:
     expected_hz: float
     alignment: str
     max_skew_sec: float | None = None
+    hard_max_skew_sec: float | None = None
+    max_consecutive_skew_violations: int | None = None
+    max_skew_violation_ratio: float | None = None
     max_gap_sec: float | None = None
     max_action_age_sec: float | None = None
     names: tuple[str, ...] = ()

@@ -143,15 +143,22 @@ def summarize_quality_dir(quality_dir: Path) -> dict[str, Any]:
                 json.loads(line) for line in rejected_path.read_text().splitlines() if line.strip()
             )
     reasons: dict[str, int] = {}
+    warnings: dict[str, int] = {}
     for report in reports:
         for reason in report["reject_reasons"]:
             reasons[reason] = reasons.get(reason, 0) + 1
-    passed = sum(report.get("status") == "PASS" for report in reports)
+        for reason in report.get("warning_reasons", []):
+            warnings[reason] = warnings.get(reason, 0) + 1
+    passed = sum(report.get("status") in {"PASS", "PASS_WITH_WARNING"} for report in reports)
     return {
         "episode_count": len(reports),
         "pass_count": passed,
+        "pass_with_warning_count": sum(
+            report.get("status") == "PASS_WITH_WARNING" for report in reports
+        ),
         "reject_count": len(reports) - passed,
         "reject_reasons": dict(sorted(reasons.items())),
+        "warning_reasons": dict(sorted(warnings.items())),
     }
 
 
@@ -171,10 +178,14 @@ def _numeric_distribution(values: list[float]) -> dict[str, float | None]:
 
 def processing_audit_summary(reports: list[dict[str, Any]]) -> dict[str, Any]:
     reasons: dict[str, int] = {}
+    warnings: dict[str, int] = {}
     for report in reports:
         for reason in report["reject_reasons"]:
             reasons[reason] = reasons.get(reason, 0) + 1
-    passed = sum(report["status"] == "PASS" for report in reports)
+        for reason in report.get("warning_reasons", []):
+            warnings[reason] = warnings.get(reason, 0) + 1
+    passed = sum(report["status"] in {"PASS", "PASS_WITH_WARNING"} for report in reports)
+    passed_with_warning = sum(report["status"] == "PASS_WITH_WARNING" for report in reports)
     activity_durations = [
         (report["activity"]["active_end_ns"] - report["activity"]["active_start_ns"]) * 1e-9
         for report in reports
@@ -248,12 +259,39 @@ def processing_audit_summary(reports: list[dict[str, Any]]) -> dict[str, Any]:
                     if "reused_frame_ratio" in metric
                 ]
             )
+            stream_summary[key]["soft_skew_violation_count"] = _numeric_distribution(
+                [
+                    float(metric["soft_skew_violation_count"])
+                    for metric in metrics
+                    if "soft_skew_violation_count" in metric
+                ]
+            )
+            stream_summary[key]["soft_skew_violation_ratio"] = _numeric_distribution(
+                [
+                    float(metric["soft_skew_violation_ratio"])
+                    for metric in metrics
+                    if "soft_skew_violation_ratio" in metric
+                ]
+            )
+            stream_summary[key]["maximum_consecutive_soft_skew_violations"] = _numeric_distribution(
+                [
+                    float(metric["maximum_consecutive_soft_skew_violations"])
+                    for metric in metrics
+                    if "maximum_consecutive_soft_skew_violations" in metric
+                ]
+            )
+            for metric_name in ("boundary_trimmed_before", "boundary_trimmed_after"):
+                stream_summary[key][metric_name] = _numeric_distribution(
+                    [float(metric[metric_name]) for metric in metrics if metric_name in metric]
+                )
         outputs[output_name] = {"streams": stream_summary}
     return {
         "episode_count": len(reports),
         "pass_count": passed,
+        "pass_with_warning_count": passed_with_warning,
         "reject_count": len(reports) - passed,
         "reject_reasons": dict(sorted(reasons.items())),
+        "warning_reasons": dict(sorted(warnings.items())),
         "activity_duration_sec": _numeric_distribution(activity_durations),
         "filtering": filtering,
         "lag_sec": lag,

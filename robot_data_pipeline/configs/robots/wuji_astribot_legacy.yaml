@@ -59,6 +59,9 @@ streams:
     expected_hz: 30
     alignment: nearest
     max_skew_sec: 0.02
+    hard_max_skew_sec: 0.04
+    max_consecutive_skew_violations: 1
+    max_skew_violation_ratio: 0.005
     max_gap_sec: 0.1
   video.right_wrist:
     topic: /astribot_camera/right_wrist_rgbd/color_compress/compressed
@@ -69,6 +72,9 @@ streams:
     expected_hz: 30
     alignment: nearest
     max_skew_sec: 0.02
+    hard_max_skew_sec: 0.04
+    max_consecutive_skew_violations: 1
+    max_skew_violation_ratio: 0.005
     max_gap_sec: 0.1
 
   state.left_arm_joint:

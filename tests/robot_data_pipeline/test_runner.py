@@ -16,7 +16,12 @@ from robot_data_pipeline.models import (
     ProcessingConfig,
     ProcessingRoster,
 )
-from robot_data_pipeline.runner import _prepared_episodes, _publish_outputs, convert_job
+from robot_data_pipeline.runner import (
+    _prepared_episodes,
+    _publish_outputs,
+    _write_quality,
+    convert_job,
+)
 
 
 REPO_ROOT = Path(__file__).parents[2]
@@ -88,6 +93,27 @@ def test_all_rejected_job_publishes_quality_without_lerobot_info(tmp_path, monke
     assert not (output_path / "meta/info.json").exists()
     summary = json.loads((output_path / "quality/dataset_summary.json").read_text())
     assert summary["reject_reasons"] == {"missing_required_topic": 1}
+
+
+def test_quality_summary_counts_exported_warning_episodes(tmp_path) -> None:
+    _write_quality(
+        tmp_path,
+        [],
+        [
+            {
+                "status": "PASS_WITH_WARNING",
+                "warning_reasons": ["wrist_camera_skew_warning"],
+            },
+            {"status": "PASS", "warning_reasons": []},
+        ],
+        [],
+    )
+
+    summary = json.loads((tmp_path / "quality/dataset_summary.json").read_text())
+
+    assert summary["pass_count"] == 2
+    assert summary["pass_with_warning_count"] == 1
+    assert summary["warning_reasons"] == {"wrist_camera_skew_warning": 1}
 
 
 def test_multi_output_publication_restores_all_old_outputs_on_failure(

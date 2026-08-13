@@ -112,13 +112,13 @@ def test_sync_wrist_skew_rejection_identifies_stream_and_timestamp() -> None:
     episode, head_times = _series(profile)
     key = "video.left_wrist"
     series = episode.streams[key]
-    shifted = series.timestamps_ns.copy()
-    shifted[10] += 30_000_000
+    keep = np.ones(len(series.timestamps_ns), dtype=bool)
+    keep[8:12] = False
     episode.streams[key] = ImageSeries(
-        shifted,
-        series.bag_timestamps_ns,
-        series.encoded_images,
-        series.formats,
+        series.timestamps_ns[keep],
+        series.bag_timestamps_ns[keep],
+        tuple(value for value, selected in zip(series.encoded_images, keep) if selected),
+        tuple(value for value, selected in zip(series.formats, keep) if selected),
     )
     activity = ActivityInterval(
         round(head_times[0] * 1e9),
@@ -139,7 +139,159 @@ def test_sync_wrist_skew_rejection_identifies_stream_and_timestamp() -> None:
     assert error.value.reason == "wrist_camera_skew_exceeded"
     assert error.value.details["stream"] == key
     assert error.value.details["violation_count"] >= 1
-    assert error.value.details["absolute_skew_sec"] > error.value.details["threshold_sec"]
+    assert error.value.details["max_absolute_skew_sec"] > error.value.details["hard_threshold_sec"]
+
+
+def test_isolated_soft_wrist_skew_is_retained_with_warning() -> None:
+    profile = load_robot_profile(PROFILE)
+    episode, head_times = _series(profile)
+    key = "video.left_wrist"
+    profile = replace(
+        profile,
+        streams={
+            **profile.streams,
+            key: replace(profile.streams[key], max_skew_violation_ratio=0.1),
+        },
+    )
+    series = episode.streams[key]
+    keep = np.ones(len(series.timestamps_ns), dtype=bool)
+    keep[10] = False
+    episode.streams[key] = ImageSeries(
+        series.timestamps_ns[keep],
+        series.bag_timestamps_ns[keep],
+        tuple(value for value, selected in zip(series.encoded_images, keep) if selected),
+        tuple(value for value, selected in zip(series.formats, keep) if selected),
+    )
+    activity = ActivityInterval(
+        round(head_times[0] * 1e9),
+        round(head_times[-1] * 1e9),
+        round(head_times[0] * 1e9),
+        round(head_times[-1] * 1e9),
+    )
+
+    aligned = synchronize_episode(
+        episode,
+        profile,
+        activity,
+        action_space="joint_absolute",
+        minimum_output_frames=1,
+    )
+    report = audit_aligned_episode(aligned, output_fps=30)
+
+    assert report["status"] == "PASS_WITH_WARNING"
+    assert report["warning_reasons"] == ["wrist_camera_skew_warning"]
+    assert report["streams"][key]["soft_skew_violation_count"] == 1
+
+
+def test_isolated_soft_wrist_skew_is_rejected_when_ratio_exceeds_limit() -> None:
+    profile = load_robot_profile(PROFILE)
+    episode, head_times = _series(profile)
+    key = "video.left_wrist"
+    series = episode.streams[key]
+    keep = np.ones(len(series.timestamps_ns), dtype=bool)
+    keep[10] = False
+    episode.streams[key] = ImageSeries(
+        series.timestamps_ns[keep],
+        series.bag_timestamps_ns[keep],
+        tuple(value for value, selected in zip(series.encoded_images, keep) if selected),
+        tuple(value for value, selected in zip(series.formats, keep) if selected),
+    )
+    activity = ActivityInterval(
+        round(head_times[0] * 1e9),
+        round(head_times[-1] * 1e9),
+        round(head_times[0] * 1e9),
+        round(head_times[-1] * 1e9),
+    )
+
+    with pytest.raises(SynchronizationError) as error:
+        synchronize_episode(
+            episode,
+            profile,
+            activity,
+            action_space="joint_absolute",
+            minimum_output_frames=1,
+        )
+
+    assert error.value.reason == "wrist_camera_skew_exceeded"
+    assert error.value.details["maximum_consecutive_violations"] == 1
+    assert (
+        error.value.details["violation_ratio"]
+        > error.value.details["maximum_allowed_violation_ratio"]
+    )
+
+
+def test_consecutive_soft_wrist_skew_is_rejected() -> None:
+    profile = load_robot_profile(PROFILE)
+    episode, head_times = _series(profile)
+    key = "video.left_wrist"
+    profile = replace(
+        profile,
+        streams={
+            **profile.streams,
+            key: replace(profile.streams[key], max_skew_violation_ratio=0.5),
+        },
+    )
+    series = episode.streams[key]
+    keep = np.ones(len(series.timestamps_ns), dtype=bool)
+    keep[9:11] = False
+    episode.streams[key] = ImageSeries(
+        series.timestamps_ns[keep],
+        series.bag_timestamps_ns[keep],
+        tuple(value for value, selected in zip(series.encoded_images, keep) if selected),
+        tuple(value for value, selected in zip(series.formats, keep) if selected),
+    )
+    activity = ActivityInterval(
+        round(head_times[0] * 1e9),
+        round(head_times[-1] * 1e9),
+        round(head_times[0] * 1e9),
+        round(head_times[-1] * 1e9),
+    )
+
+    with pytest.raises(SynchronizationError) as error:
+        synchronize_episode(
+            episode,
+            profile,
+            activity,
+            action_space="joint_absolute",
+            minimum_output_frames=1,
+        )
+
+    assert error.value.reason == "wrist_camera_skew_exceeded"
+    assert error.value.details["maximum_consecutive_violations"] > 1
+
+
+def test_wrist_boundary_coverage_is_trimmed_without_warning() -> None:
+    profile = load_robot_profile(PROFILE)
+    episode, head_times = _series(profile)
+    key = "video.left_wrist"
+    series = episode.streams[key]
+    shifted = series.timestamps_ns.copy()
+    shifted[0] += 25_000_000
+    episode.streams[key] = ImageSeries(
+        shifted,
+        series.bag_timestamps_ns,
+        series.encoded_images,
+        series.formats,
+    )
+    activity = ActivityInterval(
+        round(head_times[0] * 1e9),
+        round(head_times[-1] * 1e9),
+        round(head_times[0] * 1e9),
+        round(head_times[-1] * 1e9),
+    )
+
+    aligned = synchronize_episode(
+        episode,
+        profile,
+        activity,
+        action_space="joint_absolute",
+        minimum_output_frames=1,
+    )
+    report = audit_aligned_episode(aligned, output_fps=30)
+
+    assert len(aligned.timestamps) == len(head_times) - 1
+    assert aligned.diagnostics["video.head"]["boundary_trimmed_before"].tolist() == [1]
+    assert report["status"] == "PASS"
 
 
 def test_camera_nearest_tie_selects_earlier_frame() -> None:
@@ -150,9 +302,7 @@ def test_camera_nearest_tie_selects_earlier_frame() -> None:
         ("jpeg", "jpeg"),
     )
 
-    indices, source_times, skew = _nearest(
-        series, np.array([10], dtype=np.int64), None, stream="video.left_wrist"
-    )
+    indices, source_times, skew = _nearest(series, np.array([10], dtype=np.int64))
 
     assert indices.tolist() == [0]
     assert source_times.tolist() == [0]

@@ -32,8 +32,8 @@ confirmed external data that is not currently available.
 | 3. Activity | VERIFIED | EEF/hand measured-state velocity, time-window thresholds, padding and no-motion rejection |
 | 4. Lag audit | VERIFIED | Positive 0-300 ms search at 200 Hz, 3 s windows, per-axis confidence/median/MAD/range/trend/max-step and group consensus; insufficient overlap remains report-only |
 | 5. Filtering | VERIFIED | Fourth-order 10 Hz Butterworth, regularized high-rate grid, zero phase, padding, implementation version and Welch velocity spectrum QA |
-| 6. Synchronization | VERIFIED | Real head timestamps, linear state, SLERP, previous action, nearest wrist, bounds and structured failures |
-| 7. Aligned QA | VERIFIED | Frame counts, finite vectors, configured ranges, exact logical timestamps, skew/gap/age/reuse metrics and stable reject reasons |
+| 6. Synchronization | VERIFIED | Real head timestamps, linear state, SLERP, previous action, nearest wrist, boundary-anchor trimming, two-level wrist skew policy, bounds and structured failures |
+| 7. Aligned QA | VERIFIED | Frame counts, finite vectors, configured ranges, exact logical timestamps, skew/gap/age/reuse metrics, warning status and stable reject reasons |
 | 8. Export | VERIFIED | Parquet fields, fixed 30 fps H.264 video with ffprobe, metadata, no stats, per-frame sidecars and independent outputs |
 
 Raw gaps are warnings until activity is known. Only gaps overlapping the unpadded active interval
@@ -87,15 +87,17 @@ restored and no persistent mixed generation remains.
 | One confirmed real Manus bag smoke test | BLOCKED: no confirmed dataset found |
 | At least 50 confirmed Manus + Orin bags | BLOCKED: no confirmed dataset found |
 
-The locally executable suite contains 75 passing tests. It includes a stationary real synthetic
+The locally executable suite contains 89 passing tests. It includes a stationary real synthetic
 bag that passes raw QA and is rejected during processing with `no_valid_motion`, in addition to
 the rate, synchronization, fault-injection, export and loader coverage above.
 
 ## Pilot policy status
 
-The current-code legacy 20-bag processing pilot is complete. Two rejects were manually traced to isolated
-left-wrist missing frames, and the 20 ms skew threshold is retained. Filter and lag distributions
-are documented in `PILOT_REPORT.md`.
+The current-code legacy pilot and a targeted replay of all 20 episodes previously rejected for
+wrist skew are complete. The two-level policy recovered 18 episodes: 15 passed with an isolated
+wrist-skew warning and 3 passed after boundary-anchor trimming. Two remain rejected because their
+soft-skew violation ratios exceed 0.5%. Filter, lag and wrist-tail evidence are documented in
+`PILOT_REPORT.md`.
 
 The following production policy remains provisional until the confirmed Manus + Orin pilot:
 

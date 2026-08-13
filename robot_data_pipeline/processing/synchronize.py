@@ -207,9 +207,6 @@ def _previous(
 def _nearest(
     series: ImageSeries,
     anchors: np.ndarray,
-    max_skew_sec: float | None,
-    *,
-    stream: str,
 ):
     right = np.searchsorted(series.timestamps_ns, anchors, side="left")
     right = np.clip(right, 0, len(series.timestamps_ns) - 1)
@@ -220,15 +217,47 @@ def _nearest(
     indices = np.where(left_distance <= right_distance, left, right)
     source_times = series.timestamps_ns[indices]
     skew_ns = source_times - anchors
-    threshold_ns = round(max_skew_sec * 1e9) if max_skew_sec is not None else None
-    violations = np.flatnonzero(np.abs(skew_ns) > threshold_ns) if threshold_ns is not None else []
-    if len(violations):
-        first = int(violations[0])
+    return indices, source_times, skew_ns
+
+
+def _maximum_consecutive_true(values: np.ndarray) -> int:
+    maximum = 0
+    current = 0
+    for value in values:
+        current = current + 1 if value else 0
+        maximum = max(maximum, current)
+    return maximum
+
+
+def _audit_wrist_skew(
+    anchors: np.ndarray,
+    source_times: np.ndarray,
+    skew_ns: np.ndarray,
+    config,
+    *,
+    stream: str,
+) -> tuple[np.ndarray, int, float]:
+    assert config.max_skew_sec is not None
+    assert config.hard_max_skew_sec is not None
+    assert config.max_consecutive_skew_violations is not None
+    assert config.max_skew_violation_ratio is not None
+    soft = np.abs(skew_ns) > round(config.max_skew_sec * 1e9)
+    hard = np.abs(skew_ns) > round(config.hard_max_skew_sec * 1e9)
+    soft_count = int(np.count_nonzero(soft))
+    soft_ratio = soft_count / len(anchors) if len(anchors) else 0.0
+    consecutive = _maximum_consecutive_true(soft)
+    if (
+        np.any(hard)
+        or consecutive > config.max_consecutive_skew_violations
+        or (soft_ratio > config.max_skew_violation_ratio)
+    ):
+        first = int(np.flatnonzero(hard)[0]) if np.any(hard) else int(np.flatnonzero(soft)[0])
         maximum = int(np.argmax(np.abs(skew_ns)))
         raise SynchronizationError(
             "wrist_camera_skew_exceeded",
-            f"nearest camera skew exceeds profile threshold for {stream}: "
-            f"{abs(int(skew_ns[first])) * 1e-9:.6f}s > {max_skew_sec:.6f}s",
+            f"wrist camera skew policy rejected {stream}: max "
+            f"{abs(int(skew_ns[maximum])) * 1e-9:.6f}s, "
+            f"{soft_count}/{len(anchors)} frames exceed {config.max_skew_sec:.6f}s",
             details={
                 "stream": stream,
                 "anchor_timestamp_ns": int(anchors[first]),
@@ -236,12 +265,60 @@ def _nearest(
                 "signed_skew_sec": float(skew_ns[first] * 1e-9),
                 "absolute_skew_sec": float(abs(skew_ns[first]) * 1e-9),
                 "max_absolute_skew_sec": float(abs(skew_ns[maximum]) * 1e-9),
-                "threshold_sec": max_skew_sec,
-                "violation_count": len(violations),
+                "threshold_sec": config.max_skew_sec,
+                "hard_threshold_sec": config.hard_max_skew_sec,
+                "violation_count": soft_count,
+                "violation_ratio": soft_ratio,
+                "maximum_consecutive_violations": consecutive,
+                "maximum_allowed_consecutive_violations": (config.max_consecutive_skew_violations),
+                "maximum_allowed_violation_ratio": config.max_skew_violation_ratio,
                 "frame_count": len(anchors),
             },
         )
-    return indices, source_times, skew_ns
+    return soft, consecutive, soft_ratio
+
+
+def _head_anchor_indices(
+    episode: CanonicalEpisode,
+    head: ImageSeries,
+    activity: ActivityInterval,
+    space,
+    profile: RobotProfile,
+) -> tuple[np.ndarray, int, int]:
+    start_ns = activity.active_start_ns
+    end_ns = activity.active_end_ns
+    required_keys = (
+        *space.state_groups,
+        *space.action_groups,
+        "video.left_wrist",
+        "video.right_wrist",
+    )
+    for key in required_keys:
+        series = episode.streams.get(key)
+        if series is None or not len(series.timestamps_ns):
+            raise SynchronizationError("missing_required_stream", f"missing stream: {key}")
+        if key.startswith("state."):
+            start_ns = max(start_ns, int(series.timestamps_ns[0]))
+            end_ns = min(end_ns, int(series.timestamps_ns[-1]))
+        elif key.startswith("action."):
+            start_ns = max(start_ns, int(series.timestamps_ns[0]))
+        elif key.startswith("video."):
+            # Nearest-neighbor cameras may legitimately lead or lag the head by half a frame.
+            max_skew_sec = profile.streams[key].max_skew_sec
+            assert max_skew_sec is not None
+            tolerance_ns = round(max_skew_sec * 1e9)
+            start_ns = max(start_ns, int(series.timestamps_ns[0]) - tolerance_ns)
+            end_ns = min(end_ns, int(series.timestamps_ns[-1]) + tolerance_ns)
+    selected = np.flatnonzero((head.timestamps_ns >= start_ns) & (head.timestamps_ns <= end_ns))
+    original = np.flatnonzero(
+        (head.timestamps_ns >= activity.active_start_ns)
+        & (head.timestamps_ns <= activity.active_end_ns)
+    )
+    return (
+        selected,
+        int(selected[0] - original[0]) if len(selected) and len(original) else 0,
+        int(original[-1] - selected[-1]) if len(selected) and len(original) else 0,
+    )
 
 
 def synchronize_episode(
@@ -262,9 +339,8 @@ def synchronize_episode(
         ) from exc
     if not isinstance(head, ImageSeries):
         raise SynchronizationError("missing_required_stream", "video.head is not an image series")
-    selected_head = np.flatnonzero(
-        (head.timestamps_ns >= activity.active_start_ns)
-        & (head.timestamps_ns <= activity.active_end_ns)
+    selected_head, trimmed_before, trimmed_after = _head_anchor_indices(
+        episode, head, activity, space, profile
     )
     if len(selected_head) < minimum_output_frames:
         raise SynchronizationError(
@@ -285,6 +361,8 @@ def synchronize_episode(
         "video.head": {
             "source_timestamp_ns": anchors.copy(),
             "signed_skew_ns": np.zeros_like(anchors),
+            "boundary_trimmed_before": np.asarray([trimmed_before], dtype=np.int64),
+            "boundary_trimmed_after": np.asarray([trimmed_after], dtype=np.int64),
         }
     }
     images = {"video.head": tuple(head.encoded_images[index] for index in selected_head)}
@@ -358,13 +436,21 @@ def synchronize_episode(
         series = episode.streams.get(key)
         if not isinstance(series, ImageSeries):
             raise SynchronizationError("missing_required_stream", f"missing image stream: {key}")
-        indices, source_times, skew = _nearest(series, anchors, config.max_skew_sec, stream=key)
+        indices, source_times, skew = _nearest(series, anchors)
+        soft_violations, maximum_consecutive, violation_ratio = _audit_wrist_skew(
+            anchors, source_times, skew, config, stream=key
+        )
         images[key] = tuple(series.encoded_images[index] for index in indices)
         reused = np.concatenate(([False], indices[1:] == indices[:-1]))
         diagnostics[key] = {
             "source_timestamp_ns": source_times,
             "signed_skew_ns": skew,
             "frame_reused": reused,
+            "soft_skew_violation": soft_violations,
+            "maximum_consecutive_soft_skew_violations": np.asarray(
+                [maximum_consecutive], dtype=np.int64
+            ),
+            "soft_skew_violation_ratio": np.asarray([violation_ratio], dtype=np.float64),
         }
 
     state = np.concatenate(state_groups, axis=1)

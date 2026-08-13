@@ -28,6 +28,7 @@ def audit_aligned_episode(aligned: AlignedEpisodeData, *, output_fps: float) -> 
         reasons.append("non_finite_payload")
     stream_metrics = {}
     future_action_violations = 0
+    warning_reasons = []
     for key, diagnostic in aligned.diagnostics.items():
         metrics: dict[str, Any] = {}
         if "signed_skew_ns" in diagnostic:
@@ -44,12 +45,26 @@ def audit_aligned_episode(aligned: AlignedEpisodeData, *, output_fps: float) -> 
             reused = int(np.count_nonzero(diagnostic["frame_reused"]))
             metrics["reused_frame_count"] = reused
             metrics["reused_frame_ratio"] = reused / frame_count if frame_count else 0.0
+        if "boundary_trimmed_before" in diagnostic:
+            metrics["boundary_trimmed_before"] = int(diagnostic["boundary_trimmed_before"][0])
+        if "boundary_trimmed_after" in diagnostic:
+            metrics["boundary_trimmed_after"] = int(diagnostic["boundary_trimmed_after"][0])
+        if "soft_skew_violation" in diagnostic:
+            violations = int(np.count_nonzero(diagnostic["soft_skew_violation"]))
+            metrics["soft_skew_violation_count"] = violations
+            metrics["soft_skew_violation_ratio"] = violations / frame_count if frame_count else 0.0
+            metrics["maximum_consecutive_soft_skew_violations"] = int(
+                diagnostic["maximum_consecutive_soft_skew_violations"][0]
+            )
+            if violations:
+                warning_reasons.append("wrist_camera_skew_warning")
         stream_metrics[key] = metrics
     if future_action_violations:
         reasons.append("future_action_violation")
     return {
-        "status": "REJECT" if reasons else "PASS",
+        "status": "REJECT" if reasons else ("PASS_WITH_WARNING" if warning_reasons else "PASS"),
         "reject_reasons": sorted(set(reasons)),
+        "warning_reasons": sorted(set(warning_reasons)),
         "frame_count": frame_count,
         "state_dimension": aligned.state.shape[1],
         "action_dimension": aligned.action.shape[1],

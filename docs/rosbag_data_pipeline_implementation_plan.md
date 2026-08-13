@@ -179,6 +179,9 @@ streams:
     expected_hz: 30
     alignment: nearest
     max_skew_sec: 0.02
+    hard_max_skew_sec: 0.04
+    max_consecutive_skew_violations: 1
+    max_skew_violation_ratio: 0.005
 
   state.left_hand_joint:
     topic: /left_hand/joint_states
@@ -432,7 +435,7 @@ signed skew、state bracket gap 和 action age 写入 QA sidecar，不进入训�
 检查：
 
 - 三路视频帧数是否与 parquet 行数一致。
-- 每路 wrist camera 的 skew mean/p95/max。
+- 每路 wrist camera 的 skew mean/p95/max、20 ms 软阈值违规比例和最大连续违规数。
 - State interpolation bracket gap mean/p95/max。
 - Action age mean/p95/max，以及 future-action violation 数量必须为 0。
 - 同一 camera frame 被复用的次数和比例。
@@ -441,9 +444,10 @@ signed skew、state bracket gap 和 action age 写入 QA sidecar，不进入训�
 - 输出 timestamp 是否严格等于 `frame_index / 30`。
 - 裁剪后长度是否满足最低要求。
 
-Episode 只有两种最终状态：
+Episode 有三种最终状态：
 
 - PASS：通过所有 hard checks，写入输出数据集。
+- PASS_WITH_WARNING：仅存在孤立的 wrist camera 20-40 ms 偏差，且违规比例不超过 0.5%，写入输出数据集并记录 warning。
 - REJECT：不写入训练数据，写入 reject report；原始 bag 保持不变。
 
 每个 reject reason 必须是稳定、可搜索的机器标识，例如：
@@ -465,7 +469,8 @@ episode_too_short
 
 ### Stage 8：LeRobot v2 导出
 
-直接将所有 task 的 PASS episode 写入一个数据集，不先生成 per-task dataset 再 merge。
+直接将所有 task 的 PASS 和 PASS_WITH_WARNING episode 写入一个数据集，不先生成 per-task
+dataset 再 merge。
 
 输出结构：
 

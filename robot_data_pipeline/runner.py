@@ -107,14 +107,22 @@ def _write_quality(
     write_jsonl("episode_reports.jsonl", aligned_reports)
     write_jsonl("rejected_episodes.jsonl", rejected_reports)
     reason_counts: dict[str, int] = {}
+    warning_counts: dict[str, int] = {}
     for report in rejected_reports:
         for reason in report["reject_reasons"]:
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    for report in aligned_reports:
+        for reason in report.get("warning_reasons", []):
+            warning_counts[reason] = warning_counts.get(reason, 0) + 1
     summary = {
         "input_episode_count": len(raw_reports),
         "pass_count": len(aligned_reports),
+        "pass_with_warning_count": sum(
+            report.get("status") == "PASS_WITH_WARNING" for report in aligned_reports
+        ),
         "reject_count": len(rejected_reports),
         "reject_reasons": dict(sorted(reason_counts.items())),
+        "warning_reasons": dict(sorted(warning_counts.items())),
     }
     (quality / "dataset_summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -342,7 +350,17 @@ def audit_processing_roster(job: JobConfig, roster, *, episode_indices=None) -> 
                     report["outputs"][output.action_space]["details"] = exc.details
                 output_reasons.append(reason)
         report["reject_reasons"] = sorted(set(output_reasons))
-        report["status"] = "REJECT" if output_reasons else "PASS"
+        output_warnings = sorted(
+            {
+                reason
+                for output_report in report["outputs"].values()
+                for reason in output_report.get("warning_reasons", [])
+            }
+        )
+        report["warning_reasons"] = output_warnings
+        report["status"] = (
+            "REJECT" if output_reasons else ("PASS_WITH_WARNING" if output_warnings else "PASS")
+        )
         report["stage"] = "aligned"
         reports.append(report)
     return reports
@@ -399,7 +417,7 @@ def convert_job(job: JobConfig, *, overwrite: bool = False) -> dict:
                     aligned_qa = audit_aligned_episode(
                         aligned, output_fps=job.manifest.processing.output_fps
                     )
-                    if aligned_qa["status"] != "PASS":
+                    if aligned_qa["status"] == "REJECT":
                         raise SynchronizationError(
                             aligned_qa["reject_reasons"][0], "aligned QA rejected episode"
                         )
