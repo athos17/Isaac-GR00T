@@ -1,0 +1,11 @@
+schema_version: robot_profile/v1
+name: wuji_astribot_manus
+extends: wuji_astribot_legacy.yaml
+
+# Manus commands are published at 120 Hz. Keeping this in a separate resolved
+# profile prevents a normal Manus stream from being judged against the legacy rate.
+stream_overrides:
+  action.left_hand_joint:
+    expected_hz: 120
+  action.right_hand_joint:
+    expected_hz: 120

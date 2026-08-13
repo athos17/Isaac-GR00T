@@ -62,10 +62,22 @@ dev = [
     "build",
     "pre-commit",
 ]
+data-pipeline = [
+    "PyYAML>=6.0",
+    "rosbags>=0.10",
+    "pyarrow>=14",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["gr00t*"]
+include = ["gr00t*", "robot_data_pipeline*"]
+
+[tool.setuptools.package-data]
+robot_data_pipeline = [
+    "*.md",
+    "configs/robots/*.yaml",
+    "configs/datasets/*.yaml",
+]
 
 [tool.uv]
 required-environments = [

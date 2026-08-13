@@ -1,0 +1,257 @@
+schema_version: robot_profile/v1
+name: wuji_astribot_legacy
+
+clock:
+  source: header
+  semantics: publish_time
+  require_nonzero: true
+
+output_spaces:
+  joint_absolute:
+    state_groups:
+      - state.left_arm_joint
+      - state.right_arm_joint
+      - state.left_hand_joint
+      - state.right_hand_joint
+    action_groups:
+      - action.left_arm_joint
+      - action.right_arm_joint
+      - action.left_hand_joint
+      - action.right_hand_joint
+  eef_absolute_hand_absolute:
+    state_groups:
+      - state.left_eef
+      - state.right_eef
+      - state.left_hand_joint
+      - state.right_hand_joint
+    action_groups:
+      - action.left_eef
+      - action.right_eef
+      - action.left_hand_joint
+      - action.right_hand_joint
+
+activity_detection:
+  groups:
+    - state.left_eef
+    - state.right_eef
+    - state.left_hand_joint
+    - state.right_hand_joint
+  eef_velocity_threshold: 0.05
+  joint_velocity_threshold: 0.5
+  window_sec: 0.5
+
+streams:
+  video.head:
+    topic: /astribot_camera/head_rgbd/color_compress/compressed
+    adapter: sensor_msgs.compressed_image
+    message_type: sensor_msgs/msg/CompressedImage
+    semantic: rgb_image
+    required: true
+    expected_hz: 30
+    alignment: anchor
+    max_gap_sec: 0.1
+  video.left_wrist:
+    topic: /astribot_camera/left_wrist_rgbd/color_compress/compressed
+    adapter: sensor_msgs.compressed_image
+    message_type: sensor_msgs/msg/CompressedImage
+    semantic: rgb_image
+    required: true
+    expected_hz: 30
+    alignment: nearest
+    max_skew_sec: 0.02
+    max_gap_sec: 0.1
+  video.right_wrist:
+    topic: /astribot_camera/right_wrist_rgbd/color_compress/compressed
+    adapter: sensor_msgs.compressed_image
+    message_type: sensor_msgs/msg/CompressedImage
+    semantic: rgb_image
+    required: true
+    expected_hz: 30
+    alignment: nearest
+    max_skew_sec: 0.02
+    max_gap_sec: 0.1
+
+  state.left_arm_joint:
+    topic: /astribot_arm_left/joint_space_states
+    adapter: astribot_msgs.robot_joint_state_position
+    message_type: astribot_msgs/msg/RobotJointState
+    semantic: joint_position_measured
+    required: true
+    expected_hz: 250
+    alignment: linear
+    max_gap_sec: 0.05
+    names: [left_arm_joint_1, left_arm_joint_2, left_arm_joint_3, left_arm_joint_4, left_arm_joint_5, left_arm_joint_6, left_arm_joint_7]
+    allow_unnamed: true
+    unit: rad
+    range: [-6.4, 6.4]
+    continuous_joints: []
+    smoothing: {type: butterworth, cutoff_hz: 10.0, order: 4, zero_phase: true}
+  state.right_arm_joint:
+    topic: /astribot_arm_right/joint_space_states
+    adapter: astribot_msgs.robot_joint_state_position
+    message_type: astribot_msgs/msg/RobotJointState
+    semantic: joint_position_measured
+    required: true
+    expected_hz: 250
+    alignment: linear
+    max_gap_sec: 0.05
+    names: [right_arm_joint_1, right_arm_joint_2, right_arm_joint_3, right_arm_joint_4, right_arm_joint_5, right_arm_joint_6, right_arm_joint_7]
+    allow_unnamed: true
+    unit: rad
+    range: [-6.4, 6.4]
+    continuous_joints: []
+    smoothing: {type: butterworth, cutoff_hz: 10.0, order: 4, zero_phase: true}
+  action.left_arm_joint:
+    topic: /astribot_arm_left/joint_space_command_recv
+    adapter: astribot_msgs.robot_joint_state_position
+    message_type: astribot_msgs/msg/RobotJointState
+    semantic: joint_position_command_absolute
+    required: true
+    expected_hz: 250
+    alignment: previous
+    max_gap_sec: 0.05
+    max_action_age_sec: 0.05
+    names: [left_arm_joint_1, left_arm_joint_2, left_arm_joint_3, left_arm_joint_4, left_arm_joint_5, left_arm_joint_6, left_arm_joint_7]
+    allow_unnamed: true
+    unit: rad
+    range: [-6.4, 6.4]
+    continuous_joints: []
+    smoothing: {type: none}
+  action.right_arm_joint:
+    topic: /astribot_arm_right/joint_space_command_recv
+    adapter: astribot_msgs.robot_joint_state_position
+    message_type: astribot_msgs/msg/RobotJointState
+    semantic: joint_position_command_absolute
+    required: true
+    expected_hz: 250
+    alignment: previous
+    max_gap_sec: 0.05
+    max_action_age_sec: 0.05
+    names: [right_arm_joint_1, right_arm_joint_2, right_arm_joint_3, right_arm_joint_4, right_arm_joint_5, right_arm_joint_6, right_arm_joint_7]
+    allow_unnamed: true
+    unit: rad
+    range: [-6.4, 6.4]
+    continuous_joints: []
+    smoothing: {type: none}
+
+  state.left_hand_joint:
+    topic: /left_hand/joint_states
+    adapter: sensor_msgs.joint_state_position
+    message_type: sensor_msgs/msg/JointState
+    semantic: joint_position_measured
+    required: true
+    expected_hz: 200
+    alignment: linear
+    max_gap_sec: 0.05
+    names: [left_finger1_joint1, left_finger1_joint2, left_finger1_joint3, left_finger1_joint4, left_finger2_joint1, left_finger2_joint2, left_finger2_joint3, left_finger2_joint4, left_finger3_joint1, left_finger3_joint2, left_finger3_joint3, left_finger3_joint4, left_finger4_joint1, left_finger4_joint2, left_finger4_joint3, left_finger4_joint4, left_finger5_joint1, left_finger5_joint2, left_finger5_joint3, left_finger5_joint4]
+    unit: rad
+    range: [-3.2, 3.2]
+    continuous_joints: []
+    smoothing: {type: butterworth, cutoff_hz: 10.0, order: 4, zero_phase: true}
+  state.right_hand_joint:
+    topic: /right_hand/joint_states
+    adapter: sensor_msgs.joint_state_position
+    message_type: sensor_msgs/msg/JointState
+    semantic: joint_position_measured
+    required: true
+    expected_hz: 200
+    alignment: linear
+    max_gap_sec: 0.05
+    names: [right_finger1_joint1, right_finger1_joint2, right_finger1_joint3, right_finger1_joint4, right_finger2_joint1, right_finger2_joint2, right_finger2_joint3, right_finger2_joint4, right_finger3_joint1, right_finger3_joint2, right_finger3_joint3, right_finger3_joint4, right_finger4_joint1, right_finger4_joint2, right_finger4_joint3, right_finger4_joint4, right_finger5_joint1, right_finger5_joint2, right_finger5_joint3, right_finger5_joint4]
+    unit: rad
+    range: [-3.2, 3.2]
+    continuous_joints: []
+    smoothing: {type: butterworth, cutoff_hz: 10.0, order: 4, zero_phase: true}
+  action.left_hand_joint:
+    topic: /left_hand/joint_commands
+    adapter: sensor_msgs.joint_state_position
+    message_type: sensor_msgs/msg/JointState
+    semantic: joint_position_command_absolute
+    required: true
+    expected_hz: 200
+    alignment: previous
+    max_gap_sec: 0.05
+    max_action_age_sec: 0.05
+    names: [left_finger1_joint1, left_finger1_joint2, left_finger1_joint3, left_finger1_joint4, left_finger2_joint1, left_finger2_joint2, left_finger2_joint3, left_finger2_joint4, left_finger3_joint1, left_finger3_joint2, left_finger3_joint3, left_finger3_joint4, left_finger4_joint1, left_finger4_joint2, left_finger4_joint3, left_finger4_joint4, left_finger5_joint1, left_finger5_joint2, left_finger5_joint3, left_finger5_joint4]
+    unit: rad
+    range: [-3.2, 3.2]
+    continuous_joints: []
+    smoothing: {type: none}
+  action.right_hand_joint:
+    topic: /right_hand/joint_commands
+    adapter: sensor_msgs.joint_state_position
+    message_type: sensor_msgs/msg/JointState
+    semantic: joint_position_command_absolute
+    required: true
+    expected_hz: 200
+    alignment: previous
+    max_gap_sec: 0.05
+    max_action_age_sec: 0.05
+    names: [right_finger1_joint1, right_finger1_joint2, right_finger1_joint3, right_finger1_joint4, right_finger2_joint1, right_finger2_joint2, right_finger2_joint3, right_finger2_joint4, right_finger3_joint1, right_finger3_joint2, right_finger3_joint3, right_finger3_joint4, right_finger4_joint1, right_finger4_joint2, right_finger4_joint3, right_finger4_joint4, right_finger5_joint1, right_finger5_joint2, right_finger5_joint3, right_finger5_joint4]
+    unit: rad
+    range: [-3.2, 3.2]
+    continuous_joints: []
+    smoothing: {type: none}
+
+  state.left_eef:
+    topic: /astribot_arm_left/endpoint_current_states
+    adapter: astribot_msgs.robot_cartesian_pose
+    message_type: astribot_msgs/msg/RobotCartesianState
+    semantic: eef_pose_measured
+    required: true
+    expected_hz: 250
+    alignment: pose
+    max_gap_sec: 0.05
+    unit: m_rad
+    range: [-10.0, 10.0]
+    quaternion_order: xyzw
+    base_frame: robot_base
+    tool_frame: left_tool
+    smoothing: {type: butterworth, cutoff_hz: 10.0, order: 4, zero_phase: true}
+  state.right_eef:
+    topic: /astribot_arm_right/endpoint_current_states
+    adapter: astribot_msgs.robot_cartesian_pose
+    message_type: astribot_msgs/msg/RobotCartesianState
+    semantic: eef_pose_measured
+    required: true
+    expected_hz: 250
+    alignment: pose
+    max_gap_sec: 0.05
+    unit: m_rad
+    range: [-10.0, 10.0]
+    quaternion_order: xyzw
+    base_frame: robot_base
+    tool_frame: right_tool
+    smoothing: {type: butterworth, cutoff_hz: 10.0, order: 4, zero_phase: true}
+  action.left_eef:
+    topic: /astribot_arm_left/endpoint_desired_states
+    adapter: astribot_msgs.robot_cartesian_pose
+    message_type: astribot_msgs/msg/RobotCartesianState
+    semantic: eef_pose_command_absolute
+    required: true
+    expected_hz: 250
+    alignment: previous
+    max_gap_sec: 0.05
+    max_action_age_sec: 0.05
+    unit: m_rad
+    range: [-10.0, 10.0]
+    quaternion_order: xyzw
+    base_frame: robot_base
+    tool_frame: left_tool
+    smoothing: {type: none}
+  action.right_eef:
+    topic: /astribot_arm_right/endpoint_desired_states
+    adapter: astribot_msgs.robot_cartesian_pose
+    message_type: astribot_msgs/msg/RobotCartesianState
+    semantic: eef_pose_command_absolute
+    required: true
+    expected_hz: 250
+    alignment: previous
+    max_gap_sec: 0.05
+    max_action_age_sec: 0.05
+    unit: m_rad
+    range: [-10.0, 10.0]
+    quaternion_order: xyzw
+    base_frame: robot_base
+    tool_frame: right_tool
+    smoothing: {type: none}

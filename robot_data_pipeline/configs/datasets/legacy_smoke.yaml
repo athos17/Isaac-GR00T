@@ -1,0 +1,22 @@
+schema_version: dataset_manifest/v1
+profile: ../robots/wuji_astribot_legacy.yaml
+
+processing:
+  output_fps: 30
+  num_workers: 1
+  activity_padding_before_sec: 0.5
+  activity_padding_after_sec: 0.5
+  minimum_output_frames: 30
+
+outputs:
+  - action_space: eef_absolute_hand_absolute
+    path: /tmp/robot_data_pipeline_legacy_smoke_eef
+    eef_rotation_format: rot6d
+  - action_space: joint_absolute
+    path: /tmp/robot_data_pipeline_legacy_smoke_joint
+
+datasets:
+  - task_id: spray_water_smoke
+    roots:
+      - /data_all/share/datasets/teleop_chuneng/teleop_chuneng/spray_water/arm_hand_vr_20260805_151803
+    instruction: Pick up the spray bottle, pump it, then spray water on the flowers

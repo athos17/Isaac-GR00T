@@ -1,0 +1,30 @@
+{
+  "output": {
+    "first_action": 0.19971,
+    "first_state": 0.21018,
+    "last_frame_index": 46,
+    "last_timestamp": 1.533333,
+    "robot_type": "WUJI_ASTRIBOT_JOINT_ABSOLUTE_ROT6D",
+    "state_dimension": 54,
+    "total_frames": 47,
+    "total_videos": 3
+  },
+  "raw": {
+    "reject_reasons": [],
+    "status": "PASS",
+    "streams": {
+      "state.left_arm_joint": {
+        "frequency_hz": 250.0,
+        "message_count": 401
+      },
+      "state.left_hand_joint": {
+        "frequency_hz": 200.0,
+        "message_count": 321
+      },
+      "video.head": {
+        "frequency_hz": 30.0,
+        "message_count": 49
+      }
+    }
+  }
+}
