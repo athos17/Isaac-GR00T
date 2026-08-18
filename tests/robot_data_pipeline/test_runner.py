@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -35,6 +36,7 @@ def test_parallel_preparation_yields_roster_order(monkeypatch) -> None:
         return {"source": episode}
 
     monkeypatch.setattr("robot_data_pipeline.runner._prepare_episode", prepare)
+    monkeypatch.setattr("robot_data_pipeline.runner.ProcessPoolExecutor", ThreadPoolExecutor)
 
     results = list(_prepared_episodes(job, [3, 1, 4, 2]))
 

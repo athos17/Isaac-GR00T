@@ -4,7 +4,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import math
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import cv2
 import numpy as np
@@ -12,10 +12,12 @@ import numpy as np
 from robot_data_pipeline.adapters import AdapterError, get_adapter
 from robot_data_pipeline.io.rosbag2 import RosbagReadError, RosbagsReader
 from robot_data_pipeline.models import (
+    AdaptedPayload,
     BagReader,
     EpisodeAudit,
     EpisodeSpec,
     ProcessingRoster,
+    RawMessage,
     RobotProfile,
     StreamAudit,
 )
@@ -61,7 +63,11 @@ def _decode_image(encoded: bytes) -> tuple[int, int, int] | None:
 
 
 def audit_episode(
-    episode: EpisodeSpec, profile: RobotProfile, reader: BagReader | None = None
+    episode: EpisodeSpec,
+    profile: RobotProfile,
+    reader: BagReader | None = None,
+    *,
+    message_handler: Callable[[RawMessage, AdaptedPayload], None] | None = None,
 ) -> EpisodeAudit:
     reader = reader or RosbagsReader()
     reports = {
@@ -155,6 +161,8 @@ def audit_episode(
                     report.schema_mismatch_count += 1
                 _add_reason(report, reason, sequence=raw.sequence, error=str(exc))
                 continue
+            if message_handler is not None:
+                message_handler(raw, payload)
             if payload.values and not all(math.isfinite(value) for value in payload.values):
                 report.non_finite_payload_count += 1
                 _add_reason(report, NON_FINITE_PAYLOAD, sequence=raw.sequence)

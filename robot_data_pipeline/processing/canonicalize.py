@@ -7,6 +7,7 @@ import numpy as np
 
 from robot_data_pipeline.adapters import get_adapter
 from robot_data_pipeline.models import (
+    AdaptedPayload,
     CanonicalEpisode,
     ImageSeries,
     JointPositionSeries,
@@ -28,6 +29,86 @@ class CanonicalizationError(ValueError):
         self.details = details or {}
 
 
+class CanonicalizationAccumulator:
+    """Collect adapted messages and finalize the canonical stream arrays."""
+
+    def __init__(self, profile: RobotProfile, *, include_images: bool = True) -> None:
+        self.profile = profile
+        self.include_images = include_images
+        self._grouped: dict[str, list[tuple[RawMessage, AdaptedPayload]]] = defaultdict(list)
+
+    def add(self, message: RawMessage, payload: AdaptedPayload) -> None:
+        self._grouped[message.stream_key].append((message, payload))
+
+    def finish(self) -> CanonicalEpisode:
+        result = {}
+        for key, records in self._grouped.items():
+            stream = self.profile.streams[key]
+            raw_messages = [record[0] for record in records]
+            payloads = [record[1] for record in records]
+            timestamps = np.asarray(
+                [message.header_time_ns for message in raw_messages], dtype=np.int64
+            )
+            if np.any(np.diff(timestamps) <= 0):
+                raise CanonicalizationError(
+                    "non_monotonic_header_timestamp",
+                    f"{key} timestamps are not strictly increasing",
+                    details={"stream": key},
+                )
+            if stream.semantic == "rgb_image":
+                if not self.include_images:
+                    continue
+                result[key] = ImageSeries(
+                    timestamps_ns=timestamps,
+                    bag_timestamps_ns=np.asarray(
+                        [message.bag_time_ns for message in raw_messages], dtype=np.int64
+                    ),
+                    encoded_images=tuple(payload.encoded_image or b"" for payload in payloads),
+                    formats=tuple(payload.image_format or "" for payload in payloads),
+                )
+                continue
+            if stream.semantic.startswith("joint_position"):
+                values = np.stack(
+                    [_reorder(payload.values, payload.names, stream.names) for payload in payloads]
+                )
+                for name in stream.continuous_joints:
+                    values[:, stream.names.index(name)] = np.unwrap(
+                        values[:, stream.names.index(name)]
+                    )
+                series_class = (
+                    PositionCommandSeries if key.startswith("action.") else JointPositionSeries
+                )
+                result[key] = series_class(timestamps, values, stream.names)
+                continue
+            if stream.semantic.startswith("eef_pose"):
+                values = np.asarray([payload.values for payload in payloads], dtype=np.float64)
+                quaternion_norms = np.linalg.norm(values[:, 3:], axis=1)
+                invalid = np.flatnonzero((quaternion_norms < 0.5) | (quaternion_norms > 1.5))
+                if len(invalid):
+                    first = int(invalid[0])
+                    raise CanonicalizationError(
+                        QUATERNION_NORM_INVALID,
+                        f"quaternion norm outside [0.5, 1.5] for {key}: {quaternion_norms[first]:.6f}",
+                        details={
+                            "stream": key,
+                            "timestamp_ns": int(timestamps[first]),
+                            "norm": float(quaternion_norms[first]),
+                            "minimum_norm": 0.5,
+                            "maximum_norm": 1.5,
+                        },
+                    )
+                result[key] = PoseSeries(
+                    timestamps_ns=timestamps,
+                    translations=values[:, :3],
+                    quaternions_xyzw=make_quaternion_signs_continuous(values[:, 3:]),
+                )
+                continue
+            raise CanonicalizationError(
+                "unsupported_stream_semantic", f"unsupported stream semantic: {stream.semantic}"
+            )
+        return CanonicalEpisode(streams=result)
+
+
 def _reorder(
     values: tuple[float, ...], names: tuple[str, ...], target: tuple[str, ...]
 ) -> np.ndarray:
@@ -45,70 +126,9 @@ def _reorder(
 def canonicalize_messages(
     messages: Iterable[RawMessage], profile: RobotProfile, *, include_images: bool = True
 ) -> CanonicalEpisode:
-    grouped: dict[str, list[RawMessage]] = defaultdict(list)
+    accumulator = CanonicalizationAccumulator(profile, include_images=include_images)
     for message in messages:
-        grouped[message.stream_key].append(message)
-    result = {}
-    for key, raw_messages in grouped.items():
-        stream = profile.streams[key]
-        timestamps = np.asarray(
-            [message.header_time_ns for message in raw_messages], dtype=np.int64
-        )
-        if np.any(np.diff(timestamps) <= 0):
-            raise CanonicalizationError(
-                "non_monotonic_header_timestamp",
-                f"{key} timestamps are not strictly increasing",
-                details={"stream": key},
-            )
-        adapter = get_adapter(stream.adapter)
-        payloads = [adapter.adapt(message.message, stream) for message in raw_messages]
-        if stream.semantic == "rgb_image":
-            if not include_images:
-                continue
-            result[key] = ImageSeries(
-                timestamps_ns=timestamps,
-                bag_timestamps_ns=np.asarray(
-                    [message.bag_time_ns for message in raw_messages], dtype=np.int64
-                ),
-                encoded_images=tuple(payload.encoded_image or b"" for payload in payloads),
-                formats=tuple(payload.image_format or "" for payload in payloads),
-            )
-            continue
-        if stream.semantic.startswith("joint_position"):
-            values = np.stack(
-                [_reorder(payload.values, payload.names, stream.names) for payload in payloads]
-            )
-            for name in stream.continuous_joints:
-                values[:, stream.names.index(name)] = np.unwrap(values[:, stream.names.index(name)])
-            series_class = (
-                PositionCommandSeries if key.startswith("action.") else JointPositionSeries
-            )
-            result[key] = series_class(timestamps, values, stream.names)
-            continue
-        if stream.semantic.startswith("eef_pose"):
-            values = np.asarray([payload.values for payload in payloads], dtype=np.float64)
-            quaternion_norms = np.linalg.norm(values[:, 3:], axis=1)
-            invalid = np.flatnonzero((quaternion_norms < 0.5) | (quaternion_norms > 1.5))
-            if len(invalid):
-                first = int(invalid[0])
-                raise CanonicalizationError(
-                    QUATERNION_NORM_INVALID,
-                    f"quaternion norm outside [0.5, 1.5] for {key}: {quaternion_norms[first]:.6f}",
-                    details={
-                        "stream": key,
-                        "timestamp_ns": int(timestamps[first]),
-                        "norm": float(quaternion_norms[first]),
-                        "minimum_norm": 0.5,
-                        "maximum_norm": 1.5,
-                    },
-                )
-            result[key] = PoseSeries(
-                timestamps_ns=timestamps,
-                translations=values[:, :3],
-                quaternions_xyzw=make_quaternion_signs_continuous(values[:, 3:]),
-            )
-            continue
-        raise CanonicalizationError(
-            "unsupported_stream_semantic", f"unsupported stream semantic: {stream.semantic}"
-        )
-    return CanonicalEpisode(streams=result)
+        stream = profile.streams[message.stream_key]
+        payload = get_adapter(stream.adapter).adapt(message.message, stream)
+        accumulator.add(message, payload)
+    return accumulator.finish()

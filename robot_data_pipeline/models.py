@@ -85,6 +85,7 @@ class ProcessingConfig:
     video_workers: int = 3
     video_encoder_preset: str = "veryfast"
     video_encoder_threads: int = 0
+    run_lag_audit: bool = False
 
 
 @dataclass(frozen=True)

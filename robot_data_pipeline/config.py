@@ -525,7 +525,12 @@ def load_dataset_manifest(path: Path | str) -> DatasetManifest:
             "activity_padding_after_sec",
             "minimum_output_frames",
         ),
-        optional=("video_workers", "video_encoder_preset", "video_encoder_threads"),
+        optional=(
+            "video_workers",
+            "video_encoder_preset",
+            "video_encoder_threads",
+            "run_lag_audit",
+        ),
         where="processing",
     )
     workers = processing_data["num_workers"]
@@ -564,6 +569,9 @@ def load_dataset_manifest(path: Path | str) -> DatasetManifest:
         or video_encoder_threads < 0
     ):
         raise ConfigError("processing.video_encoder_threads must be a non-negative integer")
+    run_lag_audit = processing_data.get("run_lag_audit", False)
+    if not isinstance(run_lag_audit, bool):
+        raise ConfigError("processing.run_lag_audit must be boolean")
     processing = ProcessingConfig(
         output_fps=_positive_float(processing_data["output_fps"], "processing.output_fps"),
         num_workers=workers,
@@ -577,6 +585,7 @@ def load_dataset_manifest(path: Path | str) -> DatasetManifest:
         video_workers=video_workers,
         video_encoder_preset=video_encoder_preset,
         video_encoder_threads=video_encoder_threads,
+        run_lag_audit=run_lag_audit,
     )
 
     outputs = []

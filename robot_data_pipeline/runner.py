@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import asdict
 from importlib.metadata import PackageNotFoundError, version
 import json
@@ -10,6 +10,8 @@ import shutil
 import subprocess
 import sys
 import uuid
+
+from tqdm import tqdm
 
 from robot_data_pipeline.catalog import build_roster, roster_to_dict
 from robot_data_pipeline.config import ConfigError
@@ -22,7 +24,10 @@ from robot_data_pipeline.export.reports import write_alignment_diagnostics
 from robot_data_pipeline.io.rosbag2 import RosbagsReader
 from robot_data_pipeline.models import EpisodeAudit, JobConfig
 from robot_data_pipeline.processing.activity import detect_activity
-from robot_data_pipeline.processing.canonicalize import CanonicalizationError, canonicalize_messages
+from robot_data_pipeline.processing.canonicalize import (
+    CanonicalizationAccumulator,
+    CanonicalizationError,
+)
 from robot_data_pipeline.processing.filters import filter_state_streams
 from robot_data_pipeline.processing.synchronize import SynchronizationError, synchronize_episode
 from robot_data_pipeline.quality.aligned import audit_aligned_episode
@@ -202,15 +207,14 @@ def _remove_episode_artifacts(output: Path, episode_index: int, chunks_size: int
 
 def _prepare_episode(job: JobConfig, source_episode) -> dict:
     reader = RosbagsReader()
-    raw_report = audit_episode(source_episode, job.profile, reader)
+    accumulator = CanonicalizationAccumulator(job.profile)
+    raw_report = audit_episode(source_episode, job.profile, reader, message_handler=accumulator.add)
     result = {"source": source_episode, "raw": raw_report}
     if raw_report.status == "REJECT":
         result["rejection"] = _rejection(source_episode, raw_report.reject_reasons, "raw")
         return result
     try:
-        canonical = canonicalize_messages(
-            reader.messages(source_episode, job.profile.streams), job.profile
-        )
+        canonical = accumulator.finish()
         activity = detect_activity(
             canonical,
             job.profile,
@@ -241,7 +245,9 @@ def _prepare_episode(job: JobConfig, source_episode) -> dict:
                 f"{first['interval_sec']:.6f}s > {first['threshold_sec']:.6f}s",
                 details=first,
             )
-        lag_audits = _lag_audits(canonical, activity)
+        lag_audits = (
+            _lag_audits(canonical, activity) if job.manifest.processing.run_lag_audit else {}
+        )
         filtered, filter_manifest = filter_state_streams(
             canonical,
             job.profile,
@@ -271,20 +277,36 @@ def _prepared_episodes(job: JobConfig, episodes) -> object:
             yield _prepare_episode(job, episode)
         return
     episode_iterator = iter(episodes)
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="rosbag-pipeline") as executor:
-        pending: list[Future] = []
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        pending: dict[Future, int] = {}
+        ready: dict[int, dict] = {}
+        next_submitted = 0
+        next_to_yield = 0
+
+        def submit_next() -> bool:
+            try:
+                episode = next(episode_iterator)
+            except StopIteration:
+                return False
+            future = executor.submit(_prepare_episode, job, episode)
+            pending[future] = next_submitted
+            return True
+
         for _ in range(workers):
-            try:
-                pending.append(executor.submit(_prepare_episode, job, next(episode_iterator)))
-            except StopIteration:
+            if not submit_next():
                 break
+            next_submitted += 1
+
         while pending:
-            future = pending.pop(0)
-            yield future.result()
-            try:
-                pending.append(executor.submit(_prepare_episode, job, next(episode_iterator)))
-            except StopIteration:
-                pass
+            completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                sequence = pending.pop(future)
+                ready[sequence] = future.result()
+                if submit_next():
+                    next_submitted += 1
+            while next_to_yield in ready:
+                yield ready.pop(next_to_yield)
+                next_to_yield += 1
 
 
 def audit_processing_roster(job: JobConfig, roster, *, episode_indices=None) -> list[dict]:
@@ -366,7 +388,7 @@ def audit_processing_roster(job: JobConfig, roster, *, episode_indices=None) -> 
     return reports
 
 
-def convert_job(job: JobConfig, *, overwrite: bool = False) -> dict:
+def convert_job(job: JobConfig, *, overwrite: bool = False, show_progress: bool = False) -> dict:
     roster = build_roster(job)
     temporary_outputs = {}
     try:
@@ -388,6 +410,17 @@ def convert_job(job: JobConfig, *, overwrite: bool = False) -> dict:
         }
         for output in job.manifest.outputs
     }
+    progress = (
+        tqdm(
+            total=len(roster.episodes),
+            desc="Converting episodes",
+            unit="episode",
+            dynamic_ncols=True,
+            file=sys.stderr,
+        )
+        if show_progress
+        else None
+    )
     try:
         for prepared in _prepared_episodes(job, roster.episodes):
             source_episode = prepared["source"]
@@ -397,6 +430,8 @@ def convert_job(job: JobConfig, *, overwrite: bool = False) -> dict:
             if "rejection" in prepared:
                 for output_state in states.values():
                     output_state["rejected"].append(prepared["rejection"])
+                if progress is not None:
+                    progress.update()
                 continue
             filtered = prepared["filtered"]
             activity = prepared["activity"]
@@ -480,6 +515,8 @@ def convert_job(job: JobConfig, *, overwrite: bool = False) -> dict:
                             exc.details if isinstance(exc, SynchronizationError) else None,
                         )
                     )
+            if progress is not None:
+                progress.update()
 
         for output in job.manifest.outputs:
             output_state = states[output.action_space]
@@ -533,6 +570,9 @@ def convert_job(job: JobConfig, *, overwrite: bool = False) -> dict:
             if temporary.exists():
                 shutil.rmtree(temporary)
         raise
+    finally:
+        if progress is not None:
+            progress.close()
     return {
         output.action_space: {
             "path": str(output.path),

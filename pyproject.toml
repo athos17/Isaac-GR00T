@@ -66,6 +66,7 @@ data-pipeline = [
     "PyYAML>=6.0",
     "rosbags>=0.10",
     "pyarrow>=14",
+    "tqdm>=4.66",
 ]
 
 [tool.setuptools.packages.find]

@@ -65,8 +65,11 @@ def test_cli_dry_runs_and_end_to_end_commands(tmp_path: Path, capsys) -> None:
     assert summarized_audit["reject_count"] == 0
 
     assert main(["convert", "--manifest", str(manifest)]) == 0
-    converted = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    converted = json.loads(captured.out)
     assert converted["joint_absolute"]["episodes"] == 1
+    assert "Converting episodes" in captured.err
+    assert "1/1" in captured.err
     assert output.is_dir()
 
     assert main(["summarize", "--quality-dir", str(output / "quality")]) == 0

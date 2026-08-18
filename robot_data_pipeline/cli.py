@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 from pathlib import Path
 import sys
@@ -42,10 +43,20 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument(
         "--max-episodes", type=int, help="audit only the first N selected episodes (pilot helper)"
     )
+    audit.add_argument(
+        "--lag-audit",
+        action="store_true",
+        help="enable the expensive action/state lag audit for processing audit",
+    )
 
     convert = subparsers.add_parser("convert", help="run the complete conversion pipeline")
     _add_manifest_argument(convert)
     convert.add_argument("--overwrite", action="store_true")
+    convert.add_argument(
+        "--lag-audit",
+        action="store_true",
+        help="enable the expensive action/state lag audit during conversion",
+    )
 
     summarize = subparsers.add_parser("summarize", help="summarize an existing quality report")
     summarize.add_argument("--quality-dir", type=Path, required=True)
@@ -78,11 +89,20 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         job, roster = _validate(args.manifest)
+        if getattr(args, "lag_audit", False):
+            processing = replace(job.manifest.processing, run_lag_audit=True)
+            job = replace(job, manifest=replace(job.manifest, processing=processing))
         if args.command == "validate" or args.dry_run:
             print(json.dumps(roster_to_dict(roster), indent=2))
             return 0
         if args.command == "convert":
-            print(json.dumps(convert_job(job, overwrite=args.overwrite), indent=2, sort_keys=True))
+            print(
+                json.dumps(
+                    convert_job(job, overwrite=args.overwrite, show_progress=True),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
             return 0
 
         indices = args.episode_index

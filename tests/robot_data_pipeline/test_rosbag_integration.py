@@ -1,3 +1,4 @@
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -118,13 +119,17 @@ def test_real_rosbag_reader_audit_and_convert(tmp_path: Path) -> None:
     assert diagnostics["frame_count"] == parquet.num_rows
     assert len(diagnostics["head_timestamp_ns"]) == parquet.num_rows
     assert len(diagnostics["streams"]["video.left_wrist"]["signed_skew_ns"]) == parquet.num_rows
+    episode_report = json.loads((output / "quality/episode_reports.jsonl").read_text())
+    assert episode_report["lag_audit"] == {}
     pipeline_manifest = json.loads((output / "meta/pipeline_manifest.json").read_text())
     assert (
         pipeline_manifest["filtering"]["state.left_hand_joint"]["implementation"]
         == "scipy_sosfiltfilt_regular_grid/v1"
     )
 
-    processing_reports = audit_processing_roster(job, roster)
+    processing = replace(job.manifest.processing, run_lag_audit=True)
+    processing_job = replace(job, manifest=replace(job.manifest, processing=processing))
+    processing_reports = audit_processing_roster(processing_job, roster)
     processing_summary = processing_audit_summary(processing_reports)
     assert processing_summary["pass_count"] == 1
     assert processing_summary["lag_sec"]["hand.left"]["p50"] is not None

@@ -795,6 +795,7 @@ data-pipeline = [
     { name = "pyarrow" },
     { name = "pyyaml" },
     { name = "rosbags" },
+    { name = "tqdm" },
 ]
 dev = [
     { name = "boto3" },
@@ -856,6 +857,7 @@ requires-dist = [
     { name = "torchcodec", marker = "platform_machine == 'x86_64'", specifier = "==0.4.0" },
     { name = "torchvision", marker = "sys_platform != 'linux'", specifier = "==0.22.1" },
     { name = "torchvision", marker = "sys_platform == 'linux'", specifier = "==0.22.1", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "tqdm", marker = "extra == 'data-pipeline'", specifier = ">=4.66" },
     { name = "transformers", specifier = "==4.57.3" },
     { name = "triton", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'", specifier = "==3.3.1", index = "https://download.pytorch.org/whl/cu128" },
     { name = "tyro", specifier = "==0.9.17" },

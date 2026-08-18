@@ -196,6 +196,39 @@ datasets:
     assert processing.video_encoder_threads == 4
 
 
+def test_lag_audit_defaults_off_and_can_be_enabled(tmp_path: Path) -> None:
+    bag = tmp_path / "bag"
+    bag.mkdir()
+    base = f"""
+schema_version: dataset_manifest/v1
+profile: {PROFILE}
+processing:
+  output_fps: 30
+  num_workers: 1
+  activity_padding_before_sec: 0.5
+  activity_padding_after_sec: 0.5
+  minimum_output_frames: 30
+outputs:
+  - action_space: joint_absolute
+    path: {{output}}
+datasets:
+  - task_id: task
+    roots: [{bag}]
+    instruction: Do the task
+"""
+    default_manifest = tmp_path / "default.yaml"
+    default_manifest.write_text(base.format(output=tmp_path / "default-output"))
+    enabled_manifest = tmp_path / "enabled.yaml"
+    enabled_manifest.write_text(
+        base.replace(
+            "minimum_output_frames: 30", "minimum_output_frames: 30\n  run_lag_audit: true"
+        ).format(output=tmp_path / "enabled-output")
+    )
+
+    assert load_job_config(default_manifest).manifest.processing.run_lag_audit is False
+    assert load_job_config(enabled_manifest).manifest.processing.run_lag_audit is True
+
+
 @pytest.mark.parametrize(
     ("field", "value", "match"),
     [

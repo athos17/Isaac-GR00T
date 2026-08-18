@@ -34,6 +34,9 @@ python -m robot_data_pipeline convert \
   --manifest robot_data_pipeline/configs/datasets/legacy_smoke.yaml
 ```
 
+Conversion displays an episode progress bar on stderr while keeping the final machine-readable
+result on stdout.
+
 Configure video throughput under `processing`:
 
 ```yaml
@@ -42,12 +45,20 @@ processing:
   video_workers: 3
   video_encoder_preset: veryfast
   video_encoder_threads: 8
+  run_lag_audit: false
 ```
 
 `video_workers: 3` encodes the head and two wrist streams concurrently. `veryfast` is the
 recommended throughput/size setting; use `medium` to reproduce the previous encoder preset or
 `ultrafast` when conversion latency matters more than compression efficiency. A thread count of
 `0` lets libx264 choose automatically.
+
+`run_lag_audit` is disabled by default because it is a report-only, CPU-intensive check and does
+not change exported values. Set it to `true`, or pass `--lag-audit` to `convert`/processing
+`audit`, when the action/state lag report is needed.
+
+`num_workers` controls process-level episode preparation when greater than `1`; results are still
+released in roster order so exported episode indices and quality reports remain deterministic.
 
 `convert` never edits input bags and refuses existing output paths. `--overwrite`
 only accepts a directory containing this pipeline's `meta/pipeline_manifest.json`.
