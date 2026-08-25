@@ -173,6 +173,8 @@ class Gr00tN1d7Processor(BaseProcessor):
         use_mean_std: bool = False,
         # Backward-compat params (stored but not actively used)
         letter_box_transform: bool = False,
+        # TrainingRTC layout metadata.  Older processors omit this field.
+        training_rtc_action_layout: dict[str, dict[str, Any]] | None = None,
     ):
         self.modality_configs = parse_modality_configs(modality_configs)
 
@@ -227,6 +229,19 @@ class Gr00tN1d7Processor(BaseProcessor):
 
         # Statistics cache (mirrors state_action_processor.statistics for serialization)
         self.statistics: dict[str, dict[str, dict[str, dict[str, list[float]]]]] = {}
+        self.action_dim: dict[str, int] = {}
+        self.action_layout: dict[str, dict[str, Any]] = {}
+        self.training_rtc_action_layout = training_rtc_action_layout
+        if statistics is not None:
+            self.set_statistics(statistics, override=True)
+        if self.training_rtc_action_layout is not None:
+            for tag, expected in self.training_rtc_action_layout.items():
+                actual = self.action_layout.get(tag)
+                if actual is None or actual != expected:
+                    raise ValueError(
+                        f"TrainingRTC action layout mismatch for '{tag}': "
+                        f"checkpoint={expected}, processor={actual}"
+                    )
 
         # Choose between torchvision and albumentations transforms
         self.use_albumentations = use_albumentations
@@ -284,12 +299,52 @@ class Gr00tN1d7Processor(BaseProcessor):
 
         self.state_action_processor.set_statistics(statistics, override=override)
 
-        # Compute action dimensions for convenience
+        self._refresh_action_layout()
+
+    def _refresh_action_layout(self) -> None:
+        """Compute semantic/padded action layout from loaded statistics."""
         self.action_dim = {}
+        self.action_layout = {}
         for embodiment_tag in self.state_action_processor.statistics:
-            self.action_dim[embodiment_tag] = self.state_action_processor.get_action_dim(
-                embodiment_tag
-            )
+            keys = self.modality_configs[embodiment_tag]["action"].modality_keys
+            offsets = {}
+            start = 0
+            for key in keys:
+                dim = int(
+                    self.state_action_processor.norm_params[embodiment_tag]["action"][key][
+                        "dim"
+                    ].item()
+                )
+                offsets[key] = {"start": start, "end": start + dim, "dim": dim}
+                start += dim
+            self.action_dim[embodiment_tag] = start
+            if start > self.max_action_dim:
+                raise ValueError(
+                    f"Semantic action dim {start} for '{embodiment_tag}' exceeds "
+                    f"max_action_dim {self.max_action_dim}"
+                )
+            self.action_layout[embodiment_tag] = {
+                "semantic_dim": start,
+                "model_dim": self.max_action_dim,
+                "horizon": len(self.modality_configs[embodiment_tag]["action"].delta_indices),
+                "groups": offsets,
+            }
+
+    def get_action_layout(self, embodiment_tag: EmbodimentTag | str) -> dict[str, Any]:
+        """Return the validated semantic/padded action layout for an embodiment."""
+        key = embodiment_tag.value if isinstance(embodiment_tag, EmbodimentTag) else embodiment_tag
+        if key not in self.action_layout:
+            raise KeyError(f"No action layout/statistics loaded for embodiment '{key}'")
+        return self.action_layout[key]
+
+    def get_valid_dim_mask(
+        self, embodiment_tag: EmbodimentTag | str, *, batch_size: int = 1
+    ) -> torch.Tensor:
+        """Return [B, max_action_dim] mask for semantic action dimensions."""
+        layout = self.get_action_layout(embodiment_tag)
+        mask = torch.zeros((batch_size, layout["model_dim"]), dtype=torch.float32)
+        mask[:, : layout["semantic_dim"]] = 1.0
+        return mask
 
     def decode_action(
         self,
@@ -314,6 +369,51 @@ class Gr00tN1d7Processor(BaseProcessor):
         return self.state_action_processor.unapply_action(
             out_dict, embodiment_tag.value, state=state
         )
+
+    def encode_absolute_action_targets(
+        self,
+        absolute_action: dict[str, np.ndarray],
+        embodiment_tag: EmbodimentTag,
+        raw_state_snapshot: dict[str, np.ndarray],
+    ) -> np.ndarray:
+        """Encode an absolute target chunk using the request observation reference.
+
+        This is the inverse of :meth:`decode_action` for runtime prefix construction.
+        Relative EEF groups are rebased exactly once by ``apply_action`` against the
+        supplied ``raw_state_snapshot``; absolute joint groups pass through unchanged.
+        The returned array is the model's padded ``[B, H, D_model]`` layout.
+        """
+        if not raw_state_snapshot:
+            raise ValueError("raw_state_snapshot is required for action encoding")
+        tag = embodiment_tag.value
+        expected = self.modality_configs[tag]["action"].modality_keys
+        normalized = self.state_action_processor.apply_action(
+            {key: np.asarray(value).copy() for key, value in absolute_action.items()},
+            tag,
+            state=raw_state_snapshot,
+        )
+        horizon = len(self.modality_configs[tag]["action"].delta_indices)
+        chunks = []
+        for key in expected:
+            chunk = np.asarray(normalized[key])
+            # Normalize all callers to [B, H, D] while preserving the action
+            # dimension.  Runtime caches are normally unbatched [H, D].
+            if chunk.ndim == 2:
+                chunk = chunk[None, ...]
+            elif chunk.ndim != 3:
+                raise ValueError(f"Expected action group '{key}' to have 2 or 3 dimensions")
+            chunks.append(chunk[:, :horizon, :])
+        batch_size = chunks[0].shape[0]
+        semantic = np.concatenate(chunks, axis=-1).astype(np.float32, copy=False)
+        layout = self.get_action_layout(embodiment_tag)
+        if semantic.shape != (batch_size, horizon, layout["semantic_dim"]):
+            raise ValueError(
+                f"Encoded action shape {semantic.shape} does not match layout "
+                f"{(batch_size, horizon, layout['semantic_dim'])}"
+            )
+        padded = np.zeros((batch_size, horizon, layout["model_dim"]), dtype=np.float32)
+        padded[..., : layout["semantic_dim"]] = semantic
+        return padded
 
     def unapply(
         self,
@@ -448,10 +548,16 @@ class Gr00tN1d7Processor(BaseProcessor):
             f" max_action_horizon {self.max_action_horizon}. Increase model config"
             f" action_horizon to >= {action_horizon}."
         )
+        # Preserve the public inference action_mask shape [B, H]. The model
+        # combines it with valid_dim_mask when it needs a full [B, H, D] mask.
         action_mask = torch.zeros((B, self.max_action_horizon), dtype=torch.float32)
         if action_horizon > 0:
+            layout = self.get_action_layout(embodiment_tag)
             action_mask[:, :action_horizon] = 1.0
         transformed_observation["action_mask"] = action_mask
+        transformed_observation["valid_dim_mask"] = self.get_valid_dim_mask(
+            embodiment_tag, batch_size=B
+        )
 
         return BatchFeature(transformed_observation)
 
@@ -610,6 +716,9 @@ class Gr00tN1d7Processor(BaseProcessor):
         transformed_inputs.update(vlm_inputs)
         if action_mask is not None:
             transformed_inputs["action_mask"] = action_mask
+            transformed_inputs["valid_dim_mask"] = self.get_valid_dim_mask(
+                embodiment_tag, batch_size=1
+            )[0]
         transformed_inputs["embodiment_id"] = self.embodiment_id_mapping[embodiment_tag.value]
         return transformed_inputs
 
@@ -694,6 +803,7 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "max_state_dim": self.max_state_dim,
                 "max_action_dim": self.max_action_dim,
                 "max_action_horizon": self.max_action_horizon,
+                "training_rtc_action_layout": to_json_serializable(self.action_layout),
                 # StateActionProcessor settings
                 "use_percentiles": self.use_percentiles,
                 "use_mean_std": self.use_mean_std,

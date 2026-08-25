@@ -22,6 +22,7 @@ and feed it synthetic backbone output tensors.
 
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
 from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7ActionHead
+from gr00t.model.modules.embodiment_conditioned_mlp import MultiEmbodimentActionEncoder
 import pytest
 import torch
 from transformers.feature_extraction_utils import BatchFeature
@@ -121,6 +122,61 @@ class TestActionHeadForward:
         out = head.forward(_make_backbone_output(config), _make_action_input(config))
         assert torch.isfinite(out["loss"])
 
+    def test_training_rtc_conditioning_prefix_and_shared_tau(self):
+        config = _small_config(
+            training_rtc_enabled=True,
+            training_rtc_max_delay=2,
+            training_rtc_delay_pmf={0: 0.0, 1: 1.0, 2: 0.0},
+        )
+        head = Gr00tN1d7ActionHead(config)
+        actions = torch.randn(2, config.action_horizon, config.max_action_dim)
+        action_mask = torch.ones_like(actions)
+        noisy, noise, token_t, loss_mask, delays = head._build_training_rtc_conditioning(
+            actions, action_mask
+        )
+        assert torch.equal(delays, torch.ones_like(delays))
+        assert torch.equal(noisy[:, 0], actions[:, 0])
+        assert torch.equal(loss_mask[:, 0], torch.zeros_like(loss_mask[:, 0]))
+        assert torch.all(token_t[:, 0] == 1.0)
+        assert torch.allclose(token_t[:, 1:], token_t[:, 1:2])
+        assert torch.all(loss_mask[:, 1:] == 1.0)
+
+    def test_training_rtc_d0_has_no_prefix_mask(self):
+        config = _small_config(
+            training_rtc_enabled=True,
+            training_rtc_max_delay=0,
+            training_rtc_delay_pmf={0: 1.0},
+        )
+        head = Gr00tN1d7ActionHead(config)
+        actions = torch.randn(2, config.action_horizon, config.max_action_dim)
+        action_mask = torch.ones_like(actions)
+        noisy, _, token_t, loss_mask, delays = head._build_training_rtc_conditioning(
+            actions, action_mask
+        )
+        assert torch.equal(delays, torch.zeros_like(delays))
+        assert torch.all(loss_mask == action_mask)
+        assert torch.all(token_t == token_t[:, :1])
+        assert not torch.equal(noisy, actions)
+
+    def test_training_rtc_d0_matches_legacy_noise_and_tau_under_fixed_rng(self):
+        config = _small_config(
+            training_rtc_enabled=True,
+            training_rtc_max_delay=0,
+            training_rtc_delay_pmf={0: 1.0},
+        )
+        head = Gr00tN1d7ActionHead(config)
+        actions = torch.randn(2, config.action_horizon, config.max_action_dim)
+        mask = torch.ones_like(actions)
+        torch.manual_seed(1234)
+        rtc_noisy, rtc_noise, rtc_t, _, _ = head._build_training_rtc_conditioning(actions, mask)
+        torch.manual_seed(1234)
+        legacy_noise = torch.randn_like(actions)
+        legacy_tau = head.sample_time(2, actions.device, actions.dtype)
+        legacy_noisy = legacy_tau[:, None, None] * actions + (1 - legacy_tau[:, None, None]) * legacy_noise
+        torch.testing.assert_close(rtc_noise, legacy_noise)
+        torch.testing.assert_close(rtc_t[:, 0], legacy_tau)
+        torch.testing.assert_close(rtc_noisy, legacy_noisy)
+
 
 class TestActionHeadGetAction:
     """Test inference (denoising loop)."""
@@ -149,6 +205,33 @@ class TestActionHeadGetAction:
             action_input,
         )
         assert out["action_pred"].shape[0] == 1
+
+    def test_training_rtc_sampler_hard_overwrites_prefix(self):
+        config = _small_config(
+            training_rtc_enabled=True,
+            training_rtc_max_delay=2,
+            num_inference_timesteps=2,
+        )
+        head = Gr00tN1d7ActionHead(config).eval()
+        action_input = _make_action_input(config, batch_size=1)
+        committed = action_input["action"].clone()
+        out = head.get_action(
+            _make_backbone_output(config, batch_size=1),
+            action_input,
+            options={"rtc_mode": "training", "d_cond": 2},
+        )
+        assert torch.equal(out["action_pred"][:, :2], committed[:, :2])
+
+    def test_training_rtc_sampler_rejects_out_of_distribution_delay(self):
+        config = _small_config(training_rtc_enabled=True, training_rtc_max_delay=1)
+        head = Gr00tN1d7ActionHead(config).eval()
+        action_input = _make_action_input(config, batch_size=1)
+        with pytest.raises(RuntimeError, match="RTC_DELAY_OOD"):
+            head.get_action(
+                _make_backbone_output(config, batch_size=1),
+                action_input,
+                options={"rtc_mode": "training", "d_cond": 2},
+            )
 
 
 class TestActionHeadEncodeFeatures:
@@ -187,3 +270,27 @@ class TestActionHeadTrainableParams:
         head.set_trainable_parameters(True, False, True)
         for p in head.model.parameters():
             assert not p.requires_grad
+
+
+class TestTrainingRTCActionTimestep:
+    def test_action_encoder_accepts_tokenwise_timesteps(self):
+        encoder = MultiEmbodimentActionEncoder(action_dim=5, hidden_size=8, num_embodiments=2)
+        actions = torch.randn(2, 4, 5)
+        cat_ids = torch.zeros(2, dtype=torch.long)
+        scalar = torch.tensor([10, 20], dtype=torch.long)
+        tokenwise = torch.tensor([[10, 10, 20, 20], [20, 20, 10, 10]], dtype=torch.long)
+
+        scalar_out = encoder(actions, scalar, cat_ids)
+        tokenwise_out = encoder(actions, tokenwise, cat_ids)
+
+        assert scalar_out.shape == tokenwise_out.shape == (2, 4, 8)
+        assert not torch.allclose(tokenwise_out[:, 0], tokenwise_out[:, 2])
+
+    def test_action_encoder_rejects_wrong_timestep_shape(self):
+        encoder = MultiEmbodimentActionEncoder(action_dim=5, hidden_size=8, num_embodiments=2)
+        with pytest.raises(ValueError, match="Expected timesteps shape"):
+            encoder(
+                torch.randn(2, 4, 5),
+                torch.zeros(2, 3),
+                torch.zeros(2, dtype=torch.long),
+            )

@@ -108,6 +108,27 @@ class Gr00tN1d7Config(PretrainedConfig):
     noise_s: float = 0.999
     num_timestep_buckets: int = 1000
 
+    # Training-Time RTC parameters.  Runtime scheduler parameters such as `s`
+    # intentionally do not belong here.
+    training_rtc_enabled: bool = False
+    training_rtc_max_delay: int = 6
+    training_rtc_delay_sampling: str = "pmf"
+    training_rtc_delay_pmf: dict[int, float] = field(
+        default_factory=lambda: {
+            0: 0.20,
+            1: 0.05,
+            2: 0.20,
+            3: 0.25,
+            4: 0.20,
+            5: 0.05,
+            6: 0.05,
+        }
+    )
+    training_rtc_loss_mode: str = "postfix_only"
+    action_step_hz: float = 30.0
+    training_rtc_action_layout: dict[str, dict] | None = None
+    training_rtc_stats_version: str | None = None
+
     # Training parameters
     tune_projector: bool = True
     tune_diffusion_model: bool = True

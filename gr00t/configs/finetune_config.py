@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # Finetune config used for single node post-training.
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -56,6 +56,28 @@ class FinetuneConfig:
 
     tune_diffusion_model: bool = True
     """If True, fine-tune the diffusion-based action decoder (if present in the model)."""
+
+    training_rtc_enabled: bool = False
+    """Enable TrainingRTC prefix-conditioned flow-matching training."""
+
+    training_rtc_max_delay: int = 6
+    """Maximum delay supported by the TrainingRTC checkpoint."""
+
+    training_rtc_delay_pmf: dict[int, float] = field(
+        default_factory=lambda: {
+            0: 0.20,
+            1: 0.05,
+            2: 0.20,
+            3: 0.25,
+            4: 0.20,
+            5: 0.05,
+            6: 0.05,
+        }
+    )
+    """Training-only d distribution; runtime execution step s is excluded."""
+
+    training_rtc_loss_mode: str = "postfix_only"
+    action_step_hz: float = 30.0
 
     state_dropout_prob: float = 0.2
     """

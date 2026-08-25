@@ -182,3 +182,4 @@ examples/**/*.mkv
 examples/**/*.parquet
 examples/**/*.hdf5
 examples/**/*.h5
+examples/**/*.json

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import json
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -90,6 +91,13 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 state_dropout_prob=self.config.model.state_dropout_prob,
                 backbone_trainable_params_fp32=self.config.model.backbone_trainable_params_fp32,
                 load_bf16=self.config.model.load_bf16,
+                action_horizon=self.config.model.action_horizon,
+                action_step_hz=self.config.model.action_step_hz,
+                training_rtc_enabled=self.config.model.training_rtc_enabled,
+                training_rtc_max_delay=self.config.model.training_rtc_max_delay,
+                training_rtc_delay_sampling=self.config.model.training_rtc_delay_sampling,
+                training_rtc_delay_pmf=self.config.model.training_rtc_delay_pmf,
+                training_rtc_loss_mode=self.config.model.training_rtc_loss_mode,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 output_loading_info=True,
                 **self.transformers_loading_kwargs,
@@ -222,6 +230,23 @@ class Gr00tN1d7Pipeline(ModelPipeline):
         self.processor = processor
         dataset_factory = DatasetFactory(config=self.config)
         train_dataset, eval_dataset = dataset_factory.build(processor=self.processor)
+
+        # Persist the exact semantic/padded action contract in the model
+        # checkpoint as well as processor_config.json.  Runtime must reject a
+        # processor whose offsets or statistics do not match this metadata.
+        if getattr(self.model_config, "training_rtc_enabled", False):
+            layout = self.processor.action_layout
+            stats_payload = json.dumps(
+                self.processor.statistics, sort_keys=True, default=str
+            ).encode("utf-8")
+            stats_version = hashlib.sha256(stats_payload).hexdigest()[:16]
+            self.model_config.training_rtc_action_layout = layout
+            self.model_config.training_rtc_stats_version = stats_version
+            self.model.config.training_rtc_action_layout = layout
+            self.model.config.training_rtc_stats_version = stats_version
+            logging.info(
+                "TrainingRTC action contract: %s (stats_version=%s)", layout, stats_version
+            )
 
         # Rank-guarded for the same reason as final_processor_config.json above.
         if get_rank() == 0:

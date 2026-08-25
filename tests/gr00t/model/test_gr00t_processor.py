@@ -128,6 +128,12 @@ class TestProcessorCall:
         result = processor(messages)
         assert result["action_mask"].shape == result["action"].shape
 
+    def test_inference_valid_dim_mask_matches_semantic_layout(self, processor):
+        layout = processor.get_action_layout(EmbodimentTag(EMBODIMENT))
+        mask = processor.get_valid_dim_mask(EmbodimentTag(EMBODIMENT))
+        assert mask.shape == (1, layout["model_dim"])
+        assert mask.sum().item() == layout["semantic_dim"]
+
     def test_embodiment_id_is_integer(self, processor, proc_config):
         step_data = _make_step_data(proc_config)
         messages = [{"type": MessageType.EPISODE_STEP.value, "content": step_data}]

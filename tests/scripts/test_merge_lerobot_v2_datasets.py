@@ -169,3 +169,28 @@ def test_merges_lerobot_v2_datasets_and_skips_stats(tmp_path: Path) -> None:
     ).read_bytes() == b"video-0"
     assert not (output / "meta" / "stats.json").exists()
     assert not (output / "meta" / "relative_stats.json").exists()
+
+
+def test_normalizes_equivalent_task_text(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    output = tmp_path / "merged"
+    canonical = "pump the spray bottle and spray the flowers"
+    _make_dataset(first, canonical, [2])
+    _make_dataset(second, "pump the spray bottle\\n    and spray the flowers", [3])
+
+    module = _load_script_module()
+    module.main([str(first), str(second), "--output-dir", str(output)])
+
+    info = json.loads((output / "meta" / "info.json").read_text())
+    tasks = [json.loads(line) for line in (output / "meta" / "tasks.jsonl").read_text().splitlines()]
+    episodes = [
+        json.loads(line) for line in (output / "meta" / "episodes.jsonl").read_text().splitlines()
+    ]
+    assert info["total_tasks"] == 1
+    assert tasks == [{"task_index": 0, "task": canonical}]
+    assert [episode["tasks"] for episode in episodes] == [[canonical], [canonical]]
+
+    merged_second = pd.read_parquet(output / "data" / "chunk-000" / "episode_000001.parquet")
+    assert merged_second["task_index"].tolist() == [0, 0, 0]
+    assert merged_second["annotation.human.action.task_description"].tolist() == [0, 0, 0]

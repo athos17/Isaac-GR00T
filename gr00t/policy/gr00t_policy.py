@@ -33,6 +33,7 @@ from gr00t.data.interfaces import BaseProcessor
 from gr00t.data.types import MessageType, ModalityConfig, VLAStepData
 
 from .policy import BasePolicy, PolicyWrapper
+from .training_rtc_runtime import RTCGuardError, TrainingRTCRequestContext
 
 
 def _rec_to_dtype(x: Any, dtype: torch.dtype) -> Any:
@@ -406,28 +407,91 @@ class Gr00tPolicy(BasePolicy):
             messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
             processed_inputs.append(self.processor(messages))
 
+        # TrainingRTC requests carry a committed normalized prefix built by the
+        # runtime scheduler from its absolute target cache.  It is attached to
+        # the same processor layout as the ordinary action tensor.
+        rtc_context = (options or {}).get("rtc_context")
+        rtc_mode = (options or {}).get("rtc_mode")
+        if rtc_mode == "training":
+            if not isinstance(rtc_context, TrainingRTCRequestContext):
+                raise RTCGuardError("RTC_CONTEXT_INVALID", "rtc_context is required")
+            if rtc_context.committed_prefix is None and rtc_context.d_cond != 0:
+                raise RTCGuardError("RTC_CONTEXT_INVALID", "committed prefix is missing")
+
         # Step 3: Collate processed inputs into a single batch for model
         collated_inputs = self.collate_fn(processed_inputs)
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
 
+        model_options = dict(options or {})
+        if rtc_mode == "training":
+            layout = self.processor.get_action_layout(self.embodiment_tag)
+            prefix = np.zeros(
+                (1, layout["horizon"], layout["model_dim"]), dtype=np.float32
+            )
+            if rtc_context.committed_prefix is not None:
+                committed = np.asarray(rtc_context.committed_prefix)
+                if committed.ndim == 3:
+                    if committed.shape[0] != 1:
+                        raise RTCGuardError("RTC_CONTEXT_INVALID", "only batch size 1 context is supported")
+                    committed = committed[0]
+                if committed.shape != (rtc_context.d_cond, layout["model_dim"]):
+                    raise RTCGuardError(
+                        "RTC_LAYOUT_MISMATCH",
+                        f"committed prefix shape {committed.shape} does not match "
+                        f"({rtc_context.d_cond}, {layout['model_dim']})",
+                    )
+                prefix[:, : rtc_context.d_cond] = committed
+            if "inputs" in collated_inputs:
+                action_input = collated_inputs["inputs"]
+            elif "action_input" in collated_inputs:
+                action_input = collated_inputs["action_input"]
+            else:
+                raise RTCGuardError("RTC_CONTEXT_INVALID", "collator did not return model action inputs")
+            action_input["action"] = torch.from_numpy(prefix)
+            action_input["valid_dim_mask"] = self.processor.get_valid_dim_mask(
+                self.embodiment_tag, batch_size=1
+            )
+            model_options["d_cond"] = rtc_context.d_cond
+
         # Step 4: Run model inference to predict actions
         with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
+            model_pred = self.model.get_action(**collated_inputs, options=model_options or None)
         normalized_action = model_pred["action_pred"].float()
 
         # Step 5: Decode actions from normalized space back to physical units
         batched_states = {}
         for k in self.modality_configs["state"].modality_keys:
             batched_states[k] = np.stack([s[k] for s in states], axis=0)  # (B, T, D)
-        unnormalized_action = self.processor.decode_action(
-            normalized_action.cpu().numpy(), self.embodiment_tag, batched_states
-        )
+        if rtc_mode == "training":
+            # Decode the complete chunk against the request's t_obs snapshot;
+            # never substitute the newer state observed at ready/handoff.
+            unnormalized_action = self.processor.decode_action(
+                normalized_action.cpu().numpy(),
+                self.embodiment_tag,
+                {key: np.asarray(value) for key, value in rtc_context.raw_state_snapshot.items()},
+            )
+        else:
+            unnormalized_action = self.processor.decode_action(
+                normalized_action.cpu().numpy(), self.embodiment_tag, batched_states
+            )
 
         # Cast all actions to float32 for consistency
         casted_action = {
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
-        return casted_action, {}
+        info = {}
+        if rtc_mode == "training":
+            # Expose decoded absolute targets for the caller's cache manager;
+            # action values remain the normal policy return contract.
+            info["training_rtc_reference_timestamp"] = rtc_context.reference_timestamp
+            info["training_rtc_c_obs"] = rtc_context.c_obs
+            info["training_rtc_d_cond"] = rtc_context.d_cond
+            info["training_rtc_chunk_version"] = rtc_context.chunk_version
+            info["training_rtc_stats_version"] = rtc_context.stats_version
+            info["training_rtc_absolute_chunk"] = {
+                key: value.copy() for key, value in casted_action.items()
+            }
+        return casted_action, info
 
     def check_action(self, action: dict[str, Any]) -> None:
         """Validate that the action has the correct structure and types.

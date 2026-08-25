@@ -159,6 +159,64 @@ class Gr00tN1d7ActionHead(nn.Module):
         sample = (1 - sample) * self.config.noise_s
         return sample
 
+    def _timestep_to_bucket(self, timestep: torch.Tensor) -> torch.Tensor:
+        """Map continuous [0, 1] flow time to the shared legal timestep bucket."""
+        # Preserve GR00T's legacy floor mapping for every non-clean sample;
+        # an exact clean endpoint (1.0) is explicitly clamped to the last bucket.
+        return (timestep * self.num_timestep_buckets).floor().long().clamp(
+            0, self.num_timestep_buckets - 1
+        )
+
+    def _sample_training_rtc_delay(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Sample per-example TrainingRTC delays from the configured PMF."""
+        max_delay = int(self.config.training_rtc_max_delay)
+        if max_delay < 0:
+            raise ValueError("training_rtc_max_delay must be non-negative")
+        if max_delay >= self.action_horizon:
+            raise ValueError(
+                f"training_rtc_max_delay must be < action horizon {self.action_horizon}"
+            )
+        pmf = self.config.training_rtc_delay_pmf or {}
+        delays = torch.arange(max_delay + 1, device=device, dtype=torch.long)
+        probs = torch.tensor(
+            [
+                float(pmf.get(int(delay), pmf.get(str(int(delay)), 0.0)))
+                for delay in delays.tolist()
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        if torch.any(probs < 0) or probs.sum() <= 0:
+            raise ValueError("training_rtc_delay_pmf must contain non-negative mass")
+        probs = probs / probs.sum()
+        # A pure synchronous RTC run must not consume an extra random draw;
+        # this preserves the legacy FM RNG stream exactly.
+        if torch.count_nonzero(probs[1:]) == 0:
+            return torch.zeros(batch_size, device=device, dtype=torch.long)
+        return delays[torch.multinomial(probs, batch_size, replacement=True)]
+
+    def _build_training_rtc_conditioning(
+        self, actions: torch.Tensor, action_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Construct TrainingRTC noisy actions, token timesteps and postfix loss mask."""
+        batch_size, horizon, _ = actions.shape
+        # Keep the original FM random stream for noise and tau.  Delay sampling
+        # is deliberately performed afterwards so a d=0 RTC batch has the same
+        # noisy trajectory and continuous timestep as the legacy path.
+        noise = torch.randn_like(actions)
+        tau = self.sample_time(batch_size, device=actions.device, dtype=actions.dtype)
+        delays = self._sample_training_rtc_delay(batch_size, actions.device)
+        if torch.any(delays >= horizon):
+            raise ValueError(
+                f"TrainingRTC delay must be < action horizon {horizon}, got {delays.tolist()}"
+            )
+        prefix_mask = torch.arange(horizon, device=actions.device)[None, :] < delays[:, None]
+        token_t = torch.where(prefix_mask, torch.ones_like(prefix_mask, dtype=tau.dtype), tau[:, None])
+        noisy = token_t[..., None] * actions + (1.0 - token_t[..., None]) * noise
+        noisy = torch.where(prefix_mask[..., None], actions, noisy)
+        loss_mask = action_mask * (~prefix_mask[..., None]).to(action_mask.dtype)
+        return noisy, noise, token_t, loss_mask, delays
+
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         backbone_features = backbone_output["backbone_features"]
         backbone_features = self.vlln(backbone_features)
@@ -214,16 +272,45 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         # Embed noised action trajectory.
         actions = action_input.action
-        noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
-        t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
-        t = t[:, None, None]  # shape (B,1,1) for broadcast
+        action_mask = action_input.action_mask
+        if action_mask.shape != actions.shape:
+            raise ValueError(
+                f"action_mask must match action shape {tuple(actions.shape)}, "
+                f"got {tuple(action_mask.shape)}"
+            )
+        if self.config.training_rtc_enabled:
+            if self.config.training_rtc_loss_mode != "postfix_only":
+                raise ValueError(
+                    f"Unsupported TrainingRTC loss mode: {self.config.training_rtc_loss_mode}"
+                )
+            noisy_trajectory, noise, token_t, rtc_loss_mask, rtc_delay = (
+                self._build_training_rtc_conditioning(actions, action_mask)
+            )
+            velocity = actions - noise
+            # Minimal baseline: DiT keeps one global sample timestep. Prefix
+            # conditioning is expressed by ActionEncoder's token-wise input.
+            # The final token is always postfix because d < H, so its tau is
+            # the sample-level timestep retained by the minimal DiT baseline.
+            t_discretized = self._timestep_to_bucket(token_t[:, -1])
+            action_timestep = self._timestep_to_bucket(token_t)
+            action_features = self.action_encoder(
+                noisy_trajectory, action_timestep, embodiment_id
+            )
+            action_mask_for_loss = rtc_loss_mask
+        else:
+            noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
+            t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
+            t = t[:, None, None]  # shape (B,1,1) for broadcast
 
-        noisy_trajectory = (1 - t) * noise + t * actions
-        velocity = actions - noise
+            noisy_trajectory = (1 - t) * noise + t * actions
+            velocity = actions - noise
 
-        # Convert (continuous) t -> discrete if needed
-        t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
-        action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
+            # Convert (continuous) t -> discrete if needed
+            t_discretized = self._timestep_to_bucket(t[:, 0, 0])
+            action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
+            action_mask_for_loss = action_mask
+            rtc_delay = torch.zeros(actions.shape[0], device=actions.device, dtype=torch.long)
+            token_t = t[:, 0, 0][:, None].expand(-1, actions.shape[1])
 
         # Maybe add position embedding.
         if self.config.add_pos_embed:
@@ -260,14 +347,15 @@ class Gr00tN1d7ActionHead(nn.Module):
         pred_actions = pred[:, -actions.shape[1] :]
 
         # Slice out only the action portion of pred and target.
-        action_mask = action_input.action_mask
-        action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
-        loss = action_loss.sum() / (action_mask.sum() + 1e-6)
+        action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask_for_loss
+        loss = action_loss.sum() / (action_mask_for_loss.sum() + 1e-6)
 
         return {
             "loss": loss,
             "action_loss": action_loss,
-            "action_mask": action_mask,
+            "action_mask": action_mask_for_loss,
+            "rtc_delay": rtc_delay,
+            "rtc_token_timestep": token_t,
             "backbone_features": vl_embeds,
             "state_features": state_features,
         }
@@ -342,7 +430,58 @@ class Gr00tN1d7ActionHead(nn.Module):
         dt = 1.0 / self.num_inference_timesteps
         vel_strength = torch.ones_like(actions)
 
-        if "action" in action_input:
+        rtc_mode = (options or {}).get("rtc_mode")
+        if rtc_mode == "training":
+            if not self.config.training_rtc_enabled:
+                raise RuntimeError(
+                    "TrainingRTC inference requested but training_rtc_enabled is false"
+                )
+            if "action" not in action_input:
+                raise ValueError("TrainingRTC requires a normalized committed prefix in action_input['action']")
+            if options is None or "d_cond" not in options:
+                raise ValueError("TrainingRTC requires options['d_cond']")
+            d_cond_value = options["d_cond"]
+            if torch.is_tensor(d_cond_value):
+                d_cond = d_cond_value.to(device=device, dtype=torch.long).flatten()
+            elif isinstance(d_cond_value, (list, tuple)):
+                d_cond = torch.tensor(d_cond_value, device=device, dtype=torch.long).flatten()
+            else:
+                d_cond = torch.full((batch_size,), int(d_cond_value), device=device, dtype=torch.long)
+            if d_cond.numel() == 1:
+                d_cond = d_cond.expand(batch_size)
+            if d_cond.shape != (batch_size,):
+                raise ValueError(f"TrainingRTC d_cond must have shape [{batch_size}], got {tuple(d_cond.shape)}")
+            if torch.any(d_cond < 0) or torch.any(d_cond >= self.action_horizon):
+                raise ValueError(f"TrainingRTC d_cond must satisfy 0 <= d < {self.action_horizon}")
+            if torch.any(d_cond > int(self.config.training_rtc_max_delay)):
+                raise RuntimeError("RTC_DELAY_OOD: d_cond exceeds checkpoint.training_rtc_max_delay")
+            prefix_source = action_input["action"]
+            if prefix_source.shape[1] < self.action_horizon or prefix_source.shape[2] != self.action_dim:
+                raise ValueError(
+                    f"TrainingRTC prefix must have shape [B, >=H, {self.action_dim}], "
+                    f"got {tuple(prefix_source.shape)}"
+                )
+            prefix_mask = (
+                torch.arange(self.action_horizon, device=device)[None, :] < d_cond[:, None]
+            )
+            prefix = prefix_source[:, : self.action_horizon].to(dtype=actions.dtype, device=device)
+            actions = torch.where(prefix_mask[..., None], prefix, actions)
+            valid_dim_mask = action_input.get("valid_dim_mask")
+            if valid_dim_mask is not None:
+                if valid_dim_mask.dim() == 1:
+                    valid_dim_mask = valid_dim_mask[None, :].expand(batch_size, -1)
+                if valid_dim_mask.shape != (batch_size, self.action_dim):
+                    raise ValueError(
+                        f"valid_dim_mask must have shape {(batch_size, self.action_dim)}, "
+                        f"got {tuple(valid_dim_mask.shape)}"
+                    )
+            else:
+                valid_dim_mask = torch.ones(
+                    (batch_size, self.action_dim), device=device, dtype=actions.dtype
+                )
+            prefix_mask = prefix_mask & (valid_dim_mask.sum(dim=-1, keepdim=True) > 0)
+
+        if "action" in action_input and rtc_mode != "training":
             # If action in input when doing get action, it means we want to use RTC.
             # action_horizon is the action horizon of the input action.
             # rtc_overlap_steps is the number of steps to overlap with the previous action chunks.
@@ -383,13 +522,26 @@ class Gr00tN1d7ActionHead(nn.Module):
         # Run denoising steps.
         for t in range(self.num_inference_timesteps):
             t_cont = t / float(self.num_inference_timesteps)  # e.g. goes 0, 1/N, 2/N, ...
-            t_discretized = int(t_cont * self.num_timestep_buckets)
+            t_discretized = min(
+                int(t_cont * self.num_timestep_buckets),
+                self.num_timestep_buckets - 1,
+            )
 
             # Embed noised action trajectory.
             timesteps_tensor = torch.full(
                 size=(batch_size,), fill_value=t_discretized, device=device
             )
-            action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
+            if rtc_mode == "training":
+                action_timesteps = torch.where(
+                    prefix_mask,
+                    torch.full_like(
+                        prefix_mask, self.num_timestep_buckets - 1, dtype=torch.long
+                    ),
+                    timesteps_tensor[:, None].expand(-1, self.action_horizon),
+                )
+                action_features = self.action_encoder(actions, action_timesteps, embodiment_id)
+            else:
+                action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
             # Add position embedding.
             if self.config.add_pos_embed:
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
@@ -420,6 +572,8 @@ class Gr00tN1d7ActionHead(nn.Module):
 
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity * vel_strength
+            if rtc_mode == "training":
+                actions = torch.where(prefix_mask[..., None], prefix, actions)
 
         return BatchFeature(
             data={

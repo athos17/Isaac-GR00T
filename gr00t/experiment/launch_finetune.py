@@ -90,6 +90,19 @@ if __name__ == "__main__":
     config.model.model_name = "nvidia/Cosmos-Reason2-2B"
     config.model.backbone_trainable_params_fp32 = True
     config.model.use_relative_action = True
+    config.model.training_rtc_enabled = ft_config.training_rtc_enabled
+    config.model.training_rtc_max_delay = ft_config.training_rtc_max_delay
+    config.model.training_rtc_delay_pmf = ft_config.training_rtc_delay_pmf
+    config.model.training_rtc_loss_mode = ft_config.training_rtc_loss_mode
+    config.model.action_step_hz = ft_config.action_step_hz
+    if ft_config.training_rtc_enabled:
+        # TrainingRTC's H is the model action-token horizon.  Derive it from
+        # the registered modality contract (Wuji is 32) instead of retaining
+        # the generic N1.7 default of 40.
+        action_horizon = len(config.data.modality_configs[embodiment_tag]["action"].delta_indices)
+        if action_horizon <= 0:
+            raise ValueError("TrainingRTC requires a positive action-token horizon")
+        config.model.action_horizon = action_horizon
 
     config.training.experiment_name = ft_config.experiment_name
     config.training.start_from_checkpoint = ft_config.base_model_path

@@ -144,6 +144,11 @@ def validate_compatible_datasets(datasets: list[DatasetMeta]) -> None:
             )
 
 
+def normalize_task_text(value: Any) -> str:
+    """Canonicalize formatting differences that do not change an instruction's meaning."""
+    return " ".join(str(value).replace("\\n", " ").replace("\\r", " ").split())
+
+
 def build_task_mapping(datasets: list[DatasetMeta]) -> tuple[list[dict[str, Any]], list[dict[int, int]]]:
     merged_tasks: list[dict[str, Any]] = []
     task_to_new_index: dict[str, int] = {}
@@ -153,7 +158,7 @@ def build_task_mapping(datasets: list[DatasetMeta]) -> tuple[list[dict[str, Any]
         mapping: dict[int, int] = {}
         for task in dataset.tasks:
             old_index = int(task["task_index"])
-            task_text = str(task["task"])
+            task_text = normalize_task_text(task["task"])
             if task_text not in task_to_new_index:
                 task_to_new_index[task_text] = len(merged_tasks)
                 merged_tasks.append({"task_index": task_to_new_index[task_text], "task": task_text})
@@ -326,6 +331,10 @@ def merge_datasets(input_dirs: list[Path], output_dir: Path, overwrite: bool = F
 
             rewritten_episode = copy.deepcopy(episode)
             rewritten_episode["episode_index"] = new_episode_index
+            if "tasks" in rewritten_episode:
+                rewritten_episode["tasks"] = [
+                    normalize_task_text(task) for task in rewritten_episode["tasks"]
+                ]
             if int(rewritten_episode.get("length", episode_length)) != episode_length:
                 raise ValueError(
                     f"{source_data_path} length {episode_length} does not match episodes.jsonl"

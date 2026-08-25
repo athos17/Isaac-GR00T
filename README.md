@@ -430,6 +430,44 @@ Replace `demo_data/cube_to_bowl_5` and `examples/SO100/so100_config.py` with you
 
 > **Note:** Use `uv run torchrun` (not bare `torchrun`) to ensure the correct virtual environment is used. Add `--use-wandb` to enable Weights & Biases logging. For more extensive configuration, use `gr00t/experiment/launch_train.py`.
 
+### TrainingRTC 训练
+
+简洁的本地模型试运行、单卡和多卡命令请参阅
+[TrainingRTC 中文使用说明](learning_docs/training_rtc_usage.md)。
+
+TrainingRTC 需要在训练时显式开启。首个 checkpoint 支持 `H=32`、`30 Hz`
+动作 token 频率和 `d=0..6` 的延迟采样，默认概率主要集中在 `d=2..4`。
+运行时调度参数（例如 `s`）不属于训练参数。
+
+Wuji 相对 EEF `xyz+rot6d` 加绝对手部关节配置的训练命令如下：
+
+```bash
+GR00T_BACKBONE_MODEL_NAME=<COSMOS_BACKBONE_PATH> \
+uv run torchrun --nproc_per_node=8 --master_port=29540 \
+    gr00t/experiment/launch_finetune.py \
+    --base-model-path <BASE_MODEL_PATH> \
+    --dataset-path <WUJI_ROT6D_DATASET_PATH> \
+    --embodiment-tag NEW_EMBODIMENT \
+    --modality-config-path examples/wuji_rot6d/wuji_eef_hand_rot6d_h32_config.py \
+    --num-gpus 8 \
+    --output-dir <OUTPUT_DIR> \
+    --experiment-name wuji_rot6d_training_rtc_h32 \
+    --max-steps 20000 \
+    --global-batch-size 512 \
+    --dataloader-num-workers 6 \
+    --training-rtc-enabled \
+    --training-rtc-max-delay 6 \
+    --action-step-hz 30 \
+    --training-rtc-loss-mode postfix_only
+```
+
+试运行时将 `--num-gpus` 设为 `1`、`--max-steps` 设为 `1`、
+`--global-batch-size` 设为 `1`，并使用独立的输出目录。
+开始长时间训练前，确认保存的模型 metadata 包含
+`training_rtc_enabled=true` 和 `training_rtc_max_delay=6`。
+基础 checkpoint 还需要能够找到 `nvidia/Cosmos-Reason2-2B` 主干模型；
+离线运行时，将 `GR00T_BACKBONE_MODEL_NAME` 设置为本地主干模型目录。
+
 ### Training Tips
 
 - Maximize batch size for your hardware and train for a few thousand steps.
@@ -566,4 +604,3 @@ Support during Early Access is best-effort. We will continue iterating toward a 
   booktitle  = {ArXiv Preprint},
 }
 ```
-
