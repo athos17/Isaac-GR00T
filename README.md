@@ -435,8 +435,9 @@ Replace `demo_data/cube_to_bowl_5` and `examples/SO100/so100_config.py` with you
 简洁的本地模型试运行、单卡和多卡命令请参阅
 [TrainingRTC 中文使用说明](learning_docs/training_rtc_usage.md)。
 
-TrainingRTC 需要在训练时显式开启。首个 checkpoint 支持 `H=32`、`30 Hz`
-动作 token 频率和 `d=0..6` 的延迟采样，默认概率主要集中在 `d=2..4`。
+TrainingRTC 需要在训练时显式开启。当前 checkpoint 支持 `H=32`、`30 Hz`
+动作 token 频率；`d` 的范围必须覆盖部署端实测延迟。本机实测配置使用
+`d=0..11`，概率主要集中在 `d=8..10`。
 运行时调度参数（例如 `s`）不属于训练参数。
 
 Wuji 相对 EEF `xyz+rot6d` 加绝对手部关节配置的训练命令如下：
@@ -453,18 +454,22 @@ uv run torchrun --nproc_per_node=8 --master_port=29540 \
     --output-dir <OUTPUT_DIR> \
     --experiment-name wuji_rot6d_training_rtc_h32 \
     --max-steps 20000 \
-    --global-batch-size 512 \
+    --global-batch-size 32 \
     --dataloader-num-workers 6 \
     --training-rtc-enabled \
-    --training-rtc-max-delay 6 \
+    --training-rtc-max-delay 11 \
     --action-step-hz 30 \
     --training-rtc-loss-mode postfix_only
 ```
 
+上面是通用占位命令；使用实测延迟训练时，还必须按
+[TrainingRTC 中文使用说明](learning_docs/training_rtc_usage.md)传入 `d=0..11` 的
+完整 PMF 和实际 GPU 映射。
+
 试运行时将 `--num-gpus` 设为 `1`、`--max-steps` 设为 `1`、
 `--global-batch-size` 设为 `1`，并使用独立的输出目录。
 开始长时间训练前，确认保存的模型 metadata 包含
-`training_rtc_enabled=true` 和 `training_rtc_max_delay=6`。
+`training_rtc_enabled=true` 和部署所需的 `training_rtc_max_delay`。
 基础 checkpoint 还需要能够找到 `nvidia/Cosmos-Reason2-2B` 主干模型；
 离线运行时，将 `GR00T_BACKBONE_MODEL_NAME` 设置为本地主干模型目录。
 

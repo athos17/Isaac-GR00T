@@ -72,9 +72,19 @@ class FinetuneConfig:
             4: 0.20,
             5: 0.05,
             6: 0.05,
+            # Declare the extended range so Tyro exposes d=7..11 options.
+            7: 0.0,
+            8: 0.0,
+            9: 0.0,
+            10: 0.0,
+            11: 0.0,
         }
     )
-    """Training-only d distribution; runtime execution step s is excluded."""
+    """Training-only d distribution; runtime execution step s is excluded.
+
+    Zero-probability entries preserve the original default distribution while
+    allowing measured higher-delay checkpoints to be configured from the CLI.
+    """
 
     training_rtc_loss_mode: str = "postfix_only"
     action_step_hz: float = 30.0

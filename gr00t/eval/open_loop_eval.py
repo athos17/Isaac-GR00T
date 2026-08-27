@@ -54,6 +54,7 @@ def plot_trajectory_results(
     action_horizon: int,
     save_plot_path: str,
     plot_state: bool = True,
+    action_group_indices: dict[str, list[int]] | None = None,
 ) -> None:
     """
     Plot and save trajectory results comparing ground truth and predicted actions.
@@ -67,6 +68,8 @@ def plot_trajectory_results(
         action_keys: List of action modality keys
         action_horizon: Action horizon used for inference
         save_plot_path: Path to save the plot
+        action_group_indices: Optional mapping from a physical action group name to
+            flattened action indices. Every subplot in a group shares one y-axis range.
     """
     actual_steps = len(gt_action_across_time)
     action_dim = gt_action_across_time.shape[1]
@@ -84,6 +87,36 @@ def plot_trajectory_results(
     # Handle case where there's only one subplot
     if num_plots == 1:
         axes = [axes]
+
+    # Compute one y-axis range per physical action group. This keeps related
+    # dimensions comparable without mixing quantities with different units
+    # (for example EEF position and rotation representation).
+    group_limits: dict[str, tuple[float, float]] = {}
+    if action_group_indices:
+        plotted_values = [gt_action_across_time, pred_action_across_time]
+        if plot_state and state_joints_across_time.shape == gt_action_across_time.shape:
+            plotted_values.append(state_joints_across_time)
+        for group_name, group_indices in action_group_indices.items():
+            valid_indices = [idx for idx in group_indices if 0 <= idx < action_dim]
+            if not valid_indices:
+                continue
+            group_values = np.concatenate(
+                [values[:, valid_indices].reshape(-1) for values in plotted_values]
+            )
+            finite_values = group_values[np.isfinite(group_values)]
+            if finite_values.size == 0:
+                continue
+            lower = float(np.min(finite_values))
+            upper = float(np.max(finite_values))
+            span = upper - lower
+            padding = max(span * 0.05, max(abs(lower), abs(upper), 1.0) * 1e-3)
+            group_limits[group_name] = (lower - padding, upper + padding)
+
+    index_to_group = {
+        index: group_name
+        for group_name, group_indices in (action_group_indices or {}).items()
+        for index in group_indices
+    }
 
     # Add a global title showing the modality keys
     fig.suptitle(
@@ -115,7 +148,13 @@ def plot_trajectory_results(
             else:
                 ax.plot(j, gt_action_across_time[j, action_idx], "ro")
 
-        ax.set_title(f"Action {action_idx}")
+        group_name = index_to_group.get(action_idx)
+        if group_name in group_limits:
+            ax.set_ylim(*group_limits[group_name])
+        title = f"Action {action_idx}"
+        if group_name:
+            title += f" ({group_name})"
+        ax.set_title(title)
         ax.legend()
 
     plt.tight_layout()
@@ -232,6 +271,24 @@ def evaluate_single_trajectory(
     logging.info(f"gt_action_joints vs time {gt_action_across_time.shape}")
     logging.info(f"pred_action_joints vs time {pred_action_across_time.shape}")
 
+    # Build flattened-index groups from the actual action feature widths. EEF
+    # features are XYZ + 6D rotation; hand-joint features form one joint group.
+    action_group_indices: dict[str, list[int]] = {}
+    offset = 0
+    for key in action_keys:
+        key_values = traj[f"action.{key}"].iloc[0]
+        key_dim = int(np.atleast_1d(key_values).size)
+        key_indices = list(range(offset, offset + key_dim))
+        key_lower = key.lower()
+        if "eef" in key_lower:
+            action_group_indices.setdefault("eef_xyz", []).extend(key_indices[:3])
+            action_group_indices.setdefault("eef_rot6d", []).extend(key_indices[3:9])
+        elif "hand" in key_lower and "joint" in key_lower:
+            action_group_indices.setdefault("hand_joint", []).extend(key_indices)
+        else:
+            action_group_indices.setdefault(key, []).extend(key_indices)
+        offset += key_dim
+
     # Plot trajectory results
     plot_trajectory_results(
         state_joints_across_time=state_joints_across_time,
@@ -243,6 +300,7 @@ def evaluate_single_trajectory(
         action_horizon=action_horizon,
         save_plot_path=save_plot_path or f"/tmp/open_loop_eval/traj_{traj_id}.jpeg",
         plot_state=plot_state,
+        action_group_indices=action_group_indices,
     )
 
     return mse, mae

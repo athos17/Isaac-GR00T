@@ -122,6 +122,11 @@ class Gr00tN1d7Config(PretrainedConfig):
             4: 0.20,
             5: 0.05,
             6: 0.05,
+            7: 0.0,
+            8: 0.0,
+            9: 0.0,
+            10: 0.0,
+            11: 0.0,
         }
     )
     training_rtc_loss_mode: str = "postfix_only"

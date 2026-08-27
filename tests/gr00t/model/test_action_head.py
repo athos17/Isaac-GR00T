@@ -141,6 +141,17 @@ class TestActionHeadForward:
         assert torch.allclose(token_t[:, 1:], token_t[:, 1:2])
         assert torch.all(loss_mask[:, 1:] == 1.0)
 
+    def test_training_rtc_supports_delay_eleven(self):
+        config = _small_config(
+            training_rtc_enabled=True,
+            training_rtc_max_delay=11,
+            training_rtc_delay_pmf={11: 1.0},
+            action_horizon=32,
+        )
+        head = Gr00tN1d7ActionHead(config)
+        delays = head._sample_training_rtc_delay(batch_size=16, device=torch.device("cpu"))
+        assert torch.equal(delays, torch.full((16,), 11, dtype=torch.long))
+
     def test_training_rtc_d0_has_no_prefix_mask(self):
         config = _small_config(
             training_rtc_enabled=True,
